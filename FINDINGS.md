@@ -57,6 +57,41 @@ cache is bind-mounted at `/hf` inside the container; `link-reap-engram.sh`). Exp
   speed (300 tokens in 3.4 s vs ~11 s) but its 8.4 GiB draft only fits on the last rank with that
   rank's last two layers' experts on the CPU; the default keeps every layer on the GPUs.
 
+## 3. Measuring the pruning loss (and ruling out the port)
+
+The model card reports +4.1% text perplexity for dropping 112 of 384 experts per layer. That is not
+what this box measures. `tools/quality.py` scores both checkpoints through the same server stack on
+byte-identical inputs — perplexity from `prompt_logprobs`, MMLU cloze-scored through the raw
+completions API (no chat template, so no thinking, with a 2-shot format anchor) — and
+`tools/qcompare.py` runs the paired statistics. Full numbers in RESULTS.md; the shape of it:
+
+- **wikitext-2 (67k tokens): +28.3% perplexity**, paired per-window +0.2495 nats ±0.0419.
+- **Python stdlib code (30k tokens): +0.06%**, paired +0.0004 nats ±0.0092 — zero, for practical
+  purposes.
+- **MMLU over the same 1000 questions: 84.4% → 76.7%**, McNemar p < 0.0001 on 151 discordant pairs,
+  and the mean margin between the correct option and the best distractor falls 1.26 nats.
+
+The obvious worry is that our own 272-expert path is quietly broken, since `patch_reap_router.py`
+is what makes this expert count routable at all. Three things say otherwise:
+
+1. `ktests/test_reap_router.py` compares vLLM's Triton `dsv4_topk` against a torch transcription of
+   the checkpoint's reference `Gate.forward` (sqrt-softplus scores, bias steers selection only,
+   weights renormalized then scaled) for expert counts 128/160/256/272/384 at 1, 7 and 2048 tokens,
+   plus a case where a large bias must pull an expert into the top-k without inflating its weight.
+   16/16 pass: identical selection, weights within 1e-5.
+2. Code perplexity is unchanged. Mis-routed tokens — wrong expert weights, a bad expert map, a tile
+   size assuming a multiple of 32 experts — would damage code as much as prose.
+3. A 400-token greedy code edit is byte-identical to the unpruned model's output.
+
+So the loss is in the checkpoint. Its distribution is informative: what survives is the dense
+machinery plus the experts the router uses most, which covers code and formulaic text; what goes is
+the long tail that carries factual and domain knowledge. Chemistry, law, prehistory and accounting
+lose 19-33 points on MMLU while physics and geography gain a little — reshuffling at the margin on
+top of a real average drop, not uniform damage.
+
+Practical reading: this checkpoint is close to free for coding work and costs real accuracy on
+knowledge questions. The unpruned model remains available on :8004 for the latter.
+
 ## Diagnostic switches (all off by default)
 
 | switch | effect |

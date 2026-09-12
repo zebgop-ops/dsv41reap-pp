@@ -1,0 +1,26 @@
+metric                           unpruned    REAP-272E        delta
+ppl wikitext2-test.txt             2.7147       3.4821      +28.27%   (67131 tokens)
+  per-window nll delta                                      +0.2495   +-0.0419 (95% CI over 36 windows)
+ppl stdlib-code.txt                1.3633       1.3642       +0.06%   (30589 tokens)
+  per-window nll delta                                      +0.0004   +-0.0092 (95% CI over 16 windows)
+MMLU accuracy                      0.8440       0.7670       -7.70 pts  (n=1000)
+MMLU mean margin (nats)             3.400        2.142       -1.257
+
+paired MMLU over 1000 identical questions
+  both correct 730, unpruned only 114, REAP only 37, both wrong 119
+  same predicted letter: 817/1000 = 0.817
+  McNemar on 151 discordant pairs: p = 0.0000  (significant at 0.05)
+  biggest paired swings (subjects with >=12 questions):
+    high_school_chemistry                   13 ->   8 of  15    -33.3 pts
+    professional_law                        71 ->  51 of  93    -21.5 pts
+    prehistory                              19 ->  15 of  19    -21.1 pts
+    professional_accounting                 16 ->  12 of  21    -19.0 pts
+    security_studies                        16 ->  12 of  21    -19.0 pts
+    electrical_engineering                  10 ->  11 of  14     +7.1 pts
+    high_school_geography                   11 ->  12 of  12     +8.3 pts
+    high_school_physics                     13 ->  16 of  18    +16.7 pts
+  mean correct-vs-best-distractor margin: unpruned 3.400, REAP 2.143 (-1.257 nats)
+
+Router validation: ktests/test_reap_router.py (16 cases, expert counts 128/160/256/272/384,
+1..2048 tokens) checks vLLM's Triton dsv4_topk against a torch transcription of the checkpoint's
+reference Gate.forward. All pass: identical expert selection, weights within 1e-5.

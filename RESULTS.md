@@ -10,8 +10,41 @@ greedy, thinking off unless noted; "incl. prefill" numbers are wall time for the
 - Greedy output of a 400-token code-edit task is byte-identical to the unpruned model's (and to the
   8,12,8,12 layout's, which only cuts on source boundaries).
 - Needle-in-haystack recall OK at 30k and 200k tokens.
-- Three logprob probes: same texts as the unpruned model, flatter distributions (up to 2.5-4.3 nats
-  on the top token); the model card reports +4.1% text perplexity for the pruning.
+
+## What the pruning costs (measured, not the card's number)
+
+Both checkpoints were served by this same stack and scored on byte-identical inputs with
+`tools/quality.py` (perplexity from the server's `prompt_logprobs`; MMLU cloze-scored through the
+raw completions API, so no chat template and no thinking, 2-shot format anchor). `tools/qcompare.py`
+does the paired statistics. The model card reports +4.1% text perplexity; on a standard corpus the
+loss is far larger, and it is concentrated in knowledge-heavy prose rather than code.
+
+| metric | unpruned | REAP-272E | delta |
+|---|---|---|---|
+| wikitext-2 test perplexity (67,131 tokens, 36 windows) | 2.7147 | 3.4821 | **+28.3%** |
+| — paired per-window NLL | | | +0.2495 nats ±0.0419 (95% CI) |
+| Python stdlib perplexity (30,589 tokens, 16 windows) | 1.3633 | 1.3642 | +0.06% |
+| — paired per-window NLL | | | +0.0004 nats ±0.0092 (not distinguishable from zero) |
+| MMLU, 1000 questions, same questions both models | 84.4% | 76.7% | **−7.7 points** |
+| — correct vs best distractor, mean margin | 3.40 nats | 2.14 nats | −1.26 nats |
+
+Paired MMLU: 730 both correct, 114 the unpruned model alone, 37 REAP alone, 119 both wrong; the two
+models pick the same letter on 81.7% of questions. McNemar on the 151 discordant pairs gives
+p < 0.0001, so the gap is not sampling noise. Worst subjects (≥12 questions): high-school chemistry
+−33 pts, professional law −21.5, prehistory −21, professional accounting and security studies −19.
+A few move the other way (high-school physics +17, geography +8), consistent with reshuffling rather
+than uniform damage.
+
+**This is the checkpoint, not the port.** `ktests/test_reap_router.py` checks vLLM's Triton
+`dsv4_topk` (which `patch_reap_router.py` lets accept 272 experts) against a torch transcription of
+the checkpoint's own `Gate.forward` for expert counts 128/160/256/272/384 at 1..2048 tokens: expert
+selection identical, weights within 1e-5, 16/16 pass. Independently, code perplexity is unchanged
+and a 400-token greedy code edit is byte-identical to the unpruned model's output — a mis-routing
+bug could not leave those intact while costing 8 points of MMLU.
+
+**Reading it.** Code and code-shaped work look untouched; factual and reasoning-heavy prose loses
+real ground. If you serve this checkpoint for coding, the 2-3x speedup is close to free. If you
+serve it for knowledge questions, budget for roughly the accuracy of a substantially smaller model.
 
 ## Speed
 

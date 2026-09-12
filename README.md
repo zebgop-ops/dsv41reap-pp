@@ -24,10 +24,16 @@ experts from host RAM on every step, which capped decode at 14-22 tok/s and pref
 | code (copy-heavy edits / fresh code) | ~22 / ~20 tok/s | ~60-110 / ~85 tok/s |
 | prefill, 14k-token prompt | ~100 tok/s | ~3k tok/s |
 | KV pool at the served context | 0.9M tokens @131k | see RESULTS.md |
+| MMLU (1000 questions, cloze-scored) | 84.4% | 76.7% |
+| wikitext-2 perplexity | 2.715 | 3.482 |
 
-Cost: +4.1% text perplexity per the model card. On our probes the pruned model produces the same
-texts with flatter distributions; the greedy output of a 400-token code-edit task is byte-identical
-to the unpruned model's.
+Cost, measured on this box with both checkpoints on the same stack and identical inputs
+([RESULTS.md](RESULTS.md)): **wikitext-2 perplexity +28.3%** and **MMLU −7.7 points** (84.4% → 76.7%
+over the same 1000 questions, McNemar p < 0.0001), against the +4.1% text perplexity the model card
+reports. Code is the exception: stdlib perplexity moves +0.06% (inside the noise) and a 400-token
+greedy code edit is byte-identical to the unpruned model's output. The port itself is exonerated by
+`ktests/test_reap_router.py`, which matches the checkpoint's reference gate at 272 experts.
+So: near-free for coding, a real knowledge hit for everything else.
 
 ## Quickstart
 
