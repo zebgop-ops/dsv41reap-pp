@@ -1,0 +1,3394 @@
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/config/speculative.py vllm/config/speculative.py
+--- image-official/config/speculative.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/config/speculative.py	2026-09-11 14:20:26.513954716 -0700
+@@ -1531,6 +1531,13 @@
+                         self.target_parallel_config, self.draft_tensor_parallel_size
+                     )
+                 )
++                if (
++                    self.method == "dspark"
++                    and self.draft_parallel_config.pipeline_parallel_size > 1
++                ):
++                    # dsv41 dspark: the draft is not pipelined, it lives whole on the
++                    # last rank (verify_with_parallel_config would demand SupportsPP)
++                    self.draft_parallel_config.pipeline_parallel_size = 1
+ 
+         if self.index_share_for_mtp_iteration is not None:
+             if self.method != "mtp" or self.draft_model_config is None:
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/config/vllm.py vllm/config/vllm.py
+--- image-official/config/vllm.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/config/vllm.py	2026-09-11 15:22:38.250621099 -0700
+@@ -67,6 +67,13 @@
+ 
+ logger = init_logger(__name__)
+ 
++
++def _dsv41_dspark_v1() -> bool:
++    """dsv41 dspark: the overlay ports DSpark to the V1 runner (hybrid/dspark_proposer.py)."""
++    import os
++
++    return os.environ.get("DSV41_DSPARK_V1", "1") == "1"
++
+ # TODO(rocm): These models are either unsupported by MRV2 or slower with
+ # MRV2 on AMD GPUs.
+ ROCM_DEFAULT_MRV1_ARCHITECTURES = frozenset(
+@@ -1308,6 +1315,17 @@
+                 self.scheduler_config.async_scheduling = False
+             elif (
+                 self.speculative_config is not None
++                and self.speculative_config.method == "dspark"
++                and self.parallel_config.pipeline_parallel_size > 1
++            ):
++                # dsv41 dspark: async scheduling under PP needs [num_reqs, 1] sampled
++                # ids; the drafted [num_reqs, K+1] path is handled synchronously
++                logger.warning_once(
++                    "Async scheduling disabled for dspark under pipeline parallel."
++                )
++                self.scheduler_config.async_scheduling = False
++            elif (
++                self.speculative_config is not None
+                 and self.speculative_config.method not in get_args(EagleModelTypes)
+                 and self.speculative_config.method not in get_args(NgramGPUTypes)
+                 and self.speculative_config.method != "draft_model"
+@@ -2658,7 +2676,7 @@
+ 
+         # DSpark is implemented only by the V2 GPU model runner.
+         if self.speculative_config:
+-            if self.speculative_config.method == "dspark":
++            if self.speculative_config.method == "dspark" and not _dsv41_dspark_v1():
+                 unsupported.append("dspark speculative decoding")
+             if self.speculative_config.enable_adaptive_verification:
+                 unsupported.append("adaptive draft verification")
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_executor/kernels/mhc/tilelang.py vllm/model_executor/kernels/mhc/tilelang.py
+--- image-official/model_executor/kernels/mhc/tilelang.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/model_executor/kernels/mhc/tilelang.py	2026-09-10 16:15:26.271724853 -0700
+@@ -38,7 +38,11 @@
+     assert sqrsum.shape[0] == n_splits
+     assert x.shape[1] == hc_mult * hidden_size
+     assert x.shape[1] % n_splits == 0
+-    assert (x.shape[1] // n_splits) % n_thr == 0
++    if (x.shape[1] // n_splits) % n_thr != 0:
++        # Shape the tilelang kernels cannot tile; the prenorm GEMM output is
++        # tiny ([T, hc_mult3] + [T]), so torch is a cheap universal fallback.
++        _torch_hc_prenorm_gemm(x, fn, out, sqrsum)
++        return
+     use_default_config = tile_n == 12 and n_thr == 512
+     if n_splits == 1 and use_default_config and x.shape[0] >= 1024:
+         hc_prenorm_gemm_block_m_tilelang(
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_executor/layers/fused_moe/router/dsv4_topk.py vllm/model_executor/layers/fused_moe/router/dsv4_topk.py
+--- image-official/model_executor/layers/fused_moe/router/dsv4_topk.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/model_executor/layers/fused_moe/router/dsv4_topk.py	2026-09-11 21:38:22.298514139 -0700
+@@ -23,7 +23,7 @@
+         current_platform.is_cuda()
+         and gating_output.dtype == torch.float32
+         and gating_output.ndim == 2
+-        and gating_output.shape[1] in (256, 384)
++        and 1 < gating_output.shape[1] <= 1024  # dsv41 reap: any count (kernel pads to pow2)
+         and gating_output.is_contiguous()
+         and correction_bias is not None
+         and correction_bias.dtype == torch.float32
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_executor/layers/quantization/mxfp4.py vllm/model_executor/layers/quantization/mxfp4.py
+--- image-official/model_executor/layers/quantization/mxfp4.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/model_executor/layers/quantization/mxfp4.py	2026-09-11 01:26:51.474956808 -0700
+@@ -717,8 +717,18 @@
+                     and w2_bias.shape[1] == hidden_size
+                 )
+ 
+-        # Convert weights to kernel format
+-        w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
++        # dsv41: staged marlin repack (no raw+packed HBM transient)
++        if self.mxfp4_backend == Mxfp4MoeBackend.MARLIN:
++            del w13, w2, w13_scale, w2_scale  # the layer keeps the only references
++            from hybrid.marlin_staged import prepare_marlin_mxfp4_moe_staged
++
++            prepare_marlin_mxfp4_moe_staged(layer)
++            w13, w2 = layer.w13_weight, layer.w2_weight
++            w13_scale, w2_scale = layer.w13_weight_scale, layer.w2_weight_scale
++            w13_bias = getattr(layer, "w13_bias", None)
++            w2_bias = getattr(layer, "w2_bias", None)
++        else:
++          w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
+             convert_weight_to_mxfp4_moe_kernel_format(
+                 mxfp4_backend=self.mxfp4_backend,
+                 layer=layer,
+@@ -774,17 +784,15 @@
+             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+ 
+     def process_weights_after_loading(self, layer):
+-        w13 = layer.w13_weight
+-        w2 = layer.w2_weight
+-        w13_scale = layer.w13_weight_scale
+-        w2_scale = layer.w2_weight_scale
+         w13_bias = getattr(layer, "w13_bias", None)
+         w2_bias = getattr(layer, "w2_bias", None)
+ 
+         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
+             return
+ 
+-        self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
++        # dsv41: pass the raw tensors without local references (see _setup_kernel)
++        self._setup_kernel(layer, layer.w13_weight, layer.w2_weight, layer.w13_weight_scale,
++                           layer.w2_weight_scale, w13_bias, w2_bias)
+ 
+     def get_fused_moe_quant_config(
+         self,
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_executor/layers/sparse_attn_indexer.py vllm/model_executor/layers/sparse_attn_indexer.py
+--- image-official/model_executor/layers/sparse_attn_indexer.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/model_executor/layers/sparse_attn_indexer.py	2026-09-11 00:45:46.435972484 -0700
+@@ -28,6 +28,7 @@
+     fp8_fp4_mqa_logits,
+     fp8_fp4_paged_mqa_logits,
+     has_deep_gemm,
++    is_deep_gemm_supported,
+ )
+ from vllm.utils.import_utils import has_cutedsl
+ from vllm.utils.torch_utils import (
+@@ -40,6 +41,10 @@
+     DeepseekV32IndexerMetadata,
+ )
+ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
++from vllm.v1.attention.ops.mqa_logits_triton import (
++    fp8_mqa_logits_triton,
++    fp8_paged_mqa_logits_triton,
++)
+ from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+@@ -77,6 +82,82 @@
+         )
+ 
+ 
++
++import os as _os
++
++# Row-chunked prefill scoring on the Triton fallback: caps the [rows, N] fp32 logits
++# transient (the indexer's largest allocation at long context). 0 = off.
++_DSV4_LOGITS_ROW_CHUNK = int(_os.environ.get("DSV4_LOGITS_ROW_CHUNK", "64"))
++
++
++def _top_k_per_row_prefill_torch(
++    logits: torch.Tensor,
++    cu_seqlen_ks: torch.Tensor,
++    cu_seqlen_ke: torch.Tensor,
++    topk_indices: torch.Tensor,
++    topk_tokens: int,
++) -> None:
++    """torch.topk fallback with ``top_k_per_row_prefill``'s output contract
++    (vLLM PR #49897 for SM12x; the CUDA kernel's histogram path can emit
++    uninitialized indices on SM8x -> Xid 31 above ~128k tokens)."""
++    num_cols = logits.shape[1]
++    ks = cu_seqlen_ks.to(torch.long)[:, None]
++    cols = torch.arange(num_cols, device=logits.device)[None, :]
++    valid = (cols >= ks) & (cols < cu_seqlen_ke.to(torch.long)[:, None])
++    logits.masked_fill_(~valid, float("-inf"))
++    k = min(topk_tokens, num_cols)
++    top_values, top_cols = logits.topk(k, dim=-1)
++    relative = (top_cols - ks).to(torch.int32)
++    pad_sentinel = torch.iinfo(torch.int32).max
++    relative = torch.where(
++        top_values.isfinite(), relative, relative.new_full((), pad_sentinel)
++    )
++    relative, _ = relative.sort(dim=-1)
++    relative = torch.where(
++        relative == pad_sentinel, relative.new_full((), -1), relative
++    )
++    topk_indices[:, :k] = relative
++    if k < topk_tokens:
++        topk_indices[:, k:] = -1
++
++
++def _prefill_topk_needs_torch_fallback() -> bool:
++    forced = _os.environ.get("VLLM_DSV4_PREFILL_TOPK_TORCH")
++    if forced is not None:
++        return forced == "1"
++    if not current_platform.is_cuda():
++        return False
++    return current_platform.is_device_capability_family(120) or (
++        current_platform.has_device_capability(80)
++        and not current_platform.has_device_capability(90)
++    )
++
++
++def _prefill_topk(logits, ks, ke, topk_indices, num_rows, topk_tokens) -> None:
++    if _prefill_topk_needs_torch_fallback():
++        _top_k_per_row_prefill_torch(logits, ks, ke, topk_indices, topk_tokens)
++    else:
++        ops.top_k_per_row_prefill(
++            logits, ks, ke, topk_indices, num_rows,
++            logits.stride(0), logits.stride(1), topk_tokens,
++        )
++
++
++def _prefill_candidates(logits, ks, ke, chunk_candidates, candidate_block_size,
++                        candidate_write) -> None:
++    if chunk_candidates is None:
++        return
++    if candidate_write:
++        _select_candidate_blocks(
++            logits, ks, ke, chunk_candidates.shape[1], candidate_block_size,
++            chunk_candidates,
++        )
++    else:
++        _apply_candidate_mask(
++            logits, ks, ke, chunk_candidates, candidate_block_size,
++        )
++
++
+ def _merge_dcp_topk_global(
+     logits: torch.Tensor,
+     topk_indices: torch.Tensor,
+@@ -516,7 +597,7 @@
+                         cu_seqlen_ks,
+                         cu_seqlen_ke,
+                     )
+-                else:
++                elif is_deep_gemm_supported():
+                     logits = fp8_fp4_mqa_logits(
+                         (q_slice_cast, q_scale_slice),
+                         (k_quant_cast, k_scale_cast),
+@@ -525,41 +606,52 @@
+                         cu_seqlen_ke,
+                         clean_logits=False,
+                     )
+-                num_rows = logits.shape[0]
+-                if candidate_blocks is not None:
+-                    # Two-level selection (v4.1): the candidate source
+-                    # publishes its top blocks; later indexers mask their
+-                    # scores to them. Both before the row top-k.
+-                    chunk_candidates = candidate_blocks[
+-                        chunk.token_start : chunk.token_end
+-                    ]
+-                    if candidate_write:
+-                        _select_candidate_blocks(
+-                            logits,
+-                            cu_seqlen_ks,
+-                            cu_seqlen_ke,
+-                            chunk_candidates.shape[1],
+-                            candidate_block_size,
+-                            chunk_candidates,
++                else:
++                    # SM8x Triton fallback (DeepGEMM unavailable), row-chunked:
++                    # each row's candidates/top-k read only its own [ks, ke),
++                    # so blocking over rows is exact and caps the fp32 logits
++                    # transient at rows x N x 4 bytes.
++                    assert q_scale_slice is None, "FP4 indexer Q unsupported on SM8x"
++                    _tot = q_slice_cast.shape[0]
++                    _step = _DSV4_LOGITS_ROW_CHUNK if _DSV4_LOGITS_ROW_CHUNK > 0 else _tot
++                    _cands = (
++                        candidate_blocks[chunk.token_start : chunk.token_end]
++                        if candidate_blocks is not None
++                        else None
++                    )
++                    for _r0 in range(0, _tot, _step):
++                        _r1 = min(_r0 + _step, _tot)
++                        _logits = fp8_mqa_logits_triton(
++                            q_slice_cast[_r0:_r1],
++                            (k_quant_cast, k_scale_cast),
++                            weights[chunk.token_start + _r0 : chunk.token_start + _r1],
++                            cu_seqlen_ks[_r0:_r1],
++                            cu_seqlen_ke[_r0:_r1],
++                            clean_logits=False,
+                         )
+-                    else:
+-                        _apply_candidate_mask(
+-                            logits,
+-                            cu_seqlen_ks,
+-                            cu_seqlen_ke,
+-                            chunk_candidates,
+-                            candidate_block_size,
++                        _prefill_candidates(
++                            _logits, cu_seqlen_ks[_r0:_r1], cu_seqlen_ke[_r0:_r1],
++                            None if _cands is None else _cands[_r0:_r1],
++                            candidate_block_size, candidate_write,
+                         )
+-                ops.top_k_per_row_prefill(
+-                    logits,
+-                    cu_seqlen_ks,
+-                    cu_seqlen_ke,
+-                    topk_indices,
+-                    num_rows,
+-                    logits.stride(0),
+-                    logits.stride(1),
+-                    topk_tokens,
+-                )
++                        _prefill_topk(
++                            _logits, cu_seqlen_ks[_r0:_r1], cu_seqlen_ke[_r0:_r1],
++                            topk_indices[_r0:_r1], _r1 - _r0, topk_tokens,
++                        )
++                        del _logits
++                    logits = None
++                if logits is not None:
++                    num_rows = logits.shape[0]
++                    _prefill_candidates(
++                        logits, cu_seqlen_ks, cu_seqlen_ke,
++                        candidate_blocks[chunk.token_start : chunk.token_end]
++                        if candidate_blocks is not None else None,
++                        candidate_block_size, candidate_write,
++                    )
++                    _prefill_topk(
++                        logits, cu_seqlen_ks, cu_seqlen_ke, topk_indices,
++                        num_rows, topk_tokens,
++                    )
+ 
+             _merge_dcp_topk_global(
+                 logits,
+@@ -643,7 +735,7 @@
+                 decode_metadata.schedule_metadata,
+                 max_model_len,
+             )
+-        else:
++        elif is_deep_gemm_supported():
+             logits = fp8_fp4_paged_mqa_logits(
+                 (padded_q_quant_cast, padded_q_scale),
+                 kv_cache,
+@@ -655,6 +747,21 @@
+                 clean_logits=False,
+                 indices=decode_metadata.indices,
+             )
++        else:
++            # SM8x Triton fallback. The kernel scores [B, next_n] rows against
++            # the last context_lens[b] positions of each request; size the
++            # buffer to the active batch max rather than the model max.
++            assert padded_q_scale is None, "FP4 indexer Q unsupported on SM8x"
++            _ctx = seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
++            logits = fp8_paged_mqa_logits_triton(
++                padded_q_quant_cast,
++                kv_cache,
++                weights[:num_padded_tokens],
++                _ctx,
++                decode_metadata.block_table,
++                max_model_len=attn_metadata_narrowed.max_seq_len,
++                clean_logits=False,
++            )
+         num_rows = logits.shape[0]
+         if candidate_blocks is not None:
+             # Two-level selection (v4.1) on the decode logits; columns are
+@@ -694,10 +801,10 @@
+             and current_platform.has_device_capability(90)
+             and not current_platform.is_device_capability_family(120)
+         )
+-        use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
+-            512,
+-            1024,
+-            2048,
++        use_persistent_topk = (
++            current_platform.is_cuda()
++            and current_platform.has_device_capability(90)
++            and topk_tokens in (512, 1024, 2048)
+         )
+         if use_cooperative_topk:
+             workspace_manager = current_workspace_manager()
+@@ -825,6 +932,7 @@
+         topk_indices_buffer: torch.Tensor,
+         skip_k_cache_insert: bool = False,
+         use_fp4_cache: bool = False,
++        num_heads: int | None = None,
+         compress_ratio: int = 1,
+         candidate_blocks: torch.Tensor | None = None,
+         candidate_block_size: int = 0,
+@@ -857,12 +965,29 @@
+         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+         self._cp_kv_cache_interleave_size: int | None = None
+-        if current_platform.is_cuda() and not has_deep_gemm():
+-            raise RuntimeError(
+-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
+-                "the current vLLM environment."
++        if current_platform.is_cuda() and not is_deep_gemm_supported():
++            logger.warning_once(
++                "DeepGEMM not supported on this platform; using the Triton "
++                "fallback for the sparse attention indexer."
++            )
++            if use_fp4_cache:
++                raise RuntimeError(
++                    "The Triton indexer fallback needs the FP8 indexer K cache "
++                    "(set --attention-config.indexer_kv_dtype=fp8)."
++                )
++            # Prime the autotune caches now: memory profiling captures graphs
++            # before any warmup hook runs and autotuning is illegal under capture.
++            from vllm.v1.attention.ops.mqa_logits_triton import (
++                warmup_fp8_mqa_logits_triton,
++                warmup_fp8_paged_mqa_logits_triton,
+             )
+ 
++            _nh = num_heads if num_heads is not None else 32
++            device = topk_indices_buffer.device
++            warmup_fp8_mqa_logits_triton(_nh, head_dim, device)
++            for _bs in sorted({64, 128, 256, get_current_vllm_config().cache_config.block_size}):
++                warmup_fp8_paged_mqa_logits_triton(_nh, head_dim, _bs, device)
++
+     @property
+     def cp_kv_cache_interleave_size(self) -> int:
+         """With PD+DCP, the real value isn't known until block_size is finalized,
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/model_executor/model_loader/weight_utils.py vllm/model_executor/model_loader/weight_utils.py
+--- image-official/model_executor/model_loader/weight_utils.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/model_executor/model_loader/weight_utils.py	2026-09-11 14:20:26.513690245 -0700
+@@ -831,6 +831,32 @@
+     threading.Thread(target=_run_prefetch, daemon=True).start()
+ 
+ 
++import os as _dsv41_os
++import re as _dsv41_re
++
++_DSV41_SKIP_RE = (
++    _dsv41_re.compile(_dsv41_os.environ["DSV41_SKIP_WEIGHT_RE"])
++    if _dsv41_os.environ.get("DSV41_SKIP_WEIGHT_RE")
++    else None
++)
++
++
++_DSV41_ONLY_RE = None  # set transiently by hybrid/dspark_proposer.py around the draft load
++
++
++def _dsv41_skip(name: str) -> bool:
++    if _DSV41_ONLY_RE is not None and _DSV41_ONLY_RE.search(name) is None:
++        return True
++    return _DSV41_SKIP_RE is not None and _DSV41_SKIP_RE.search(name) is not None
++
++
++def _dsv41_get_tensor(f, name: str):
++    try:
++        return f.get_tensor(name)
++    except Exception as e:  # name the culprit
++        raise RuntimeError(f"safetensors get_tensor failed for {name!r}: {e}") from e
++
++
+ def safetensors_weights_iterator(
+     hf_weights_files: list[str],
+     use_tqdm_on_load: bool,
+@@ -944,9 +970,9 @@
+             with safe_open(st_file, framework="pt") as f:
+                 state_dict = {}
+                 for name in f.keys():  # noqa: SIM118
+-                    if should_skip_weight(name, local_expert_ids):
++                    if should_skip_weight(name, local_expert_ids) or _dsv41_skip(name):
+                         continue
+-                    state_dict[name] = f.get_tensor(name)
++                    state_dict[name] = _dsv41_get_tensor(f, name)
+ 
+                 # update with leftover tensor data from previous iteration, if any
+                 state_dict.update(leftover_state_dict)
+@@ -962,9 +988,9 @@
+         else:
+             with safe_open(st_file, framework="pt") as f:
+                 for name in f.keys():  # noqa: SIM118
+-                    if should_skip_weight(name, local_expert_ids):
++                    if should_skip_weight(name, local_expert_ids) or _dsv41_skip(name):
+                         continue
+-                    param = f.get_tensor(name)
++                    param = _dsv41_get_tensor(f, name)
+                     yield name, param
+ 
+ 
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4/common/ops/cache_utils.py vllm/models/deepseek_v4/common/ops/cache_utils.py
+--- image-official/models/deepseek_v4/common/ops/cache_utils.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/models/deepseek_v4/common/ops/cache_utils.py	2026-09-10 21:46:55.748380743 -0700
+@@ -30,6 +30,11 @@
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.import_utils import has_cutedsl
++from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_fp8_u8
++
++
++def is_cutedsl_supported() -> bool:
++    return has_cutedsl() and current_platform.has_device_capability(90)
+ from vllm.utils.math_utils import next_power_of_2
+ 
+ 
+@@ -130,11 +135,7 @@
+             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
+ 
+             # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
+-            if use_fnuz:
+-                x_fp8 = x_clamped.to(tl.float8e4b8)
+-            else:
+-                x_fp8 = x_clamped.to(tl.float8e4nv)
+-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
++            x_uint8 = _encode_fp8_u8(x_clamped, use_fnuz)
+ 
+             # Store as uint8 (1 byte each)
+             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
+@@ -306,13 +307,7 @@
+                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
+ 
+                 # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
+-                if use_fnuz:
+-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-                else:
+-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+-
+-                # Convert fp8 to float32 for computation
+-                x_float = x_fp8.to(tl.float32)
++                x_float = _decode_fp8_f32(x_uint8, use_fnuz)
+ 
+                 # Load and decode UE8M0 scale
+                 # UE8M0: scale = 2^(stored_value - 127)
+@@ -409,7 +404,7 @@
+     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
+     writes FNUZ on gfx942 and OCP on gfx950).
+     """
+-    if has_cutedsl():
++    if is_cutedsl_supported():
+         # lazily import, otherwise some tests fail due to CUDA driver init failure.
+         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
+             dequantize_and_gather_k_cache_cutedsl,
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4/common/ops/fused_indexer_q.py vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
+--- image-official/models/deepseek_v4/common/ops/fused_indexer_q.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/models/deepseek_v4/common/ops/fused_indexer_q.py	2026-09-10 16:14:28.945835383 -0700
+@@ -6,6 +6,12 @@
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.import_utils import has_cutedsl
++from vllm.v1.attention.ops.fp8_sm80 import _encode_fp8_u8
++
++
++def is_cutedsl_supported() -> bool:
++    # CuTe DSL kernels target SM90+; compiling them for SM8x aborts the process.
++    return has_cutedsl() and current_platform.has_device_capability(90)
+ 
+ # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
+ MXFP4_BLOCK_SIZE = 32
+@@ -142,23 +148,22 @@
+ 
+     # Store quantized values to index_q_fp8. FNUZ (e4m3fnuz) on gfx942, OCP
+     # (e4m3fn) elsewhere -- matches the K cache.
+-    fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
+     fp8_base_ptr = (
+         index_q_fp8_ptr + tok_idx * index_q_fp8_stride0 + head_idx * index_q_fp8_stride1
+     )
+     if INDEX_Q_NOPE_DIM > 0:
+         tl.store(
+             fp8_base_ptr + nope_offset,
+-            tl.div_rn(x_nope, index_q_scale).to(fp8_dtype),
++            _encode_fp8_u8(tl.div_rn(x_nope, index_q_scale), USE_FNUZ),
+         )
+     fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
+     tl.store(
+         fp8_rot_base + half_offset * 2,
+-        tl.div_rn(r_even, index_q_scale).to(fp8_dtype),
++        _encode_fp8_u8(tl.div_rn(r_even, index_q_scale), USE_FNUZ),
+     )
+     tl.store(
+         fp8_rot_base + half_offset * 2 + 1,
+-        tl.div_rn(r_odd, index_q_scale).to(fp8_dtype),
++        _encode_fp8_u8(tl.div_rn(r_odd, index_q_scale), USE_FNUZ),
+     )
+ 
+     # FP8 weight-fold contract:
+@@ -356,7 +361,7 @@
+             dtype=torch.uint8,
+             device=index_q.device,
+         )
+-        if has_cutedsl():
++        if is_cutedsl_supported():
+             # lazily import, otherwise some tests fail due to CUDA driver init failure.
+             from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
+                 fused_indexer_q_rope_quant_mxfp4_cutedsl,
+@@ -425,7 +430,7 @@
+     use_fnuz = fp8_dtype == torch.float8_e4m3fnuz
+     fp8_max = 224.0 if use_fnuz else 448.0
+     index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
+-    if has_cutedsl():
++    if is_cutedsl_supported():
+         # lazily import, otherwise some tests fail due to CUDA driver init failure.
+         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
+             fused_indexer_q_rope_quant_fp8_cutedsl,
+@@ -461,7 +466,7 @@
+             index_q_cos_sin_cache,
+             index_q_cos_sin_cache.stride(0),
+             index_q_cos_sin_cache.shape[-1] // 2,
+-            index_q_fp8,
++            index_q_fp8.view(torch.uint8),
+             index_q_fp8.stride(0),
+             index_q_fp8.stride(1),
+             index_q_head_dim,
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4/nvidia/model.py vllm/models/deepseek_v4/nvidia/model.py
+--- image-official/models/deepseek_v4/nvidia/model.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/models/deepseek_v4/nvidia/model.py	2026-09-10 16:15:26.245592563 -0700
+@@ -59,6 +59,7 @@
+     SupportsLoRA,
+     SupportsPP,
+ )
++from hybrid.cpu_experts import cpu_expert_layer_ctx as _dsv41_cpu_expert_layer_ctx
+ from vllm.model_executor.models.utils import (
+     AutoWeightsLoader,
+     PPMissingLayer,
+@@ -992,7 +993,8 @@
+         self.physical_expert_start = self.experts_start_idx
+         self.physical_expert_end = self.experts_end_idx
+ 
+-        self.experts = FusedMoEFactory(
++        with _dsv41_cpu_expert_layer_ctx(prefix):
++          self.experts = FusedMoEFactory(
+             shared_experts=self.shared_experts,
+             gate=self.gate,
+             num_experts=self.n_routed_experts,
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/ampere/ampere_sparse.py vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
+--- image-official/models/deepseek_v4_1/ampere/ampere_sparse.py	1969-12-31 16:00:00.000000000 -0800
++++ vllm/models/deepseek_v4_1/ampere/ampere_sparse.py	2026-09-10 22:28:04.866906594 -0700
+@@ -0,0 +1,181 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek V4.1 sparse MLA attention for SM8x (Ampere: A100 / CMP 170HX).
++
++Same approach as the V4 Ampere path (haosdent/vllm@f8ea5bb): the ROCm attention
++class is built on platform-neutral Triton kernels (ragged sparse prefill/decode,
++bf16 o_proj einsum, torch compressor insert); only its aiter dispatches are
++ROCm-specific and they self-disable on CUDA. fp8 conversions inside the Triton
++kernels go through ``vllm.v1.attention.ops.fp8_sm80`` (LUT decode / RNE encode)
++because Triton refuses fp8e4nv converts below SM89.
++"""
++
++import torch
++
++from vllm.models.deepseek_v4_1.amd.rocm import (
++    DeepseekV4ROCMAiterMLASparseBackend,
++    DeepseekV41ROCMAiterMLAAttention,
++    DeepseekV41ROCMAiterSparseSWABackend,
++)
++from vllm.platforms.interface import DeviceCapability
++
++
++class DeepseekV41AmpereMLASparseBackend(DeepseekV4ROCMAiterMLASparseBackend):
++    @staticmethod
++    def get_name() -> str:
++        return "TRITON_MLA_SPARSE_DSV41"
++
++    @classmethod
++    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
++        return capability.major == 8
++
++
++class DeepseekV41AmpereSparseSWABackend(DeepseekV41ROCMAiterSparseSWABackend):
++    @staticmethod
++    def get_name() -> str:
++        return "TRITON_SPARSE_SWA_DSV41"
++
++    @classmethod
++    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
++        return capability.major == 8
++
++
++class DeepseekV41AmpereMLAAttention(DeepseekV41ROCMAiterMLAAttention):
++    """SM8x DeepSeek V4.1 attention: ROCm Triton path on CUDA Ampere."""
++
++    backend_cls = DeepseekV41AmpereMLASparseBackend
++    swa_backend_cls = DeepseekV41AmpereSparseSWABackend
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # The ROCm class flips wo_a.is_bmm off so its (aiter/native) MXFP8
++        # linear kernel keeps the raw block-fp8 weight for the bf16 einsum
++        # (_get_cached_wo_a_bf16). On SM8x the MXFP8 kernel is Marlin, whose
++        # repack would destroy that layout, so keep is_bmm on and let the
++        # overlay's Marlin exemption skip the repack for bmm layers.
++        self.wo_a.is_bmm = True
++
++    def _o_proj(self, o, positions):
++        # wo_a went through the MXFP8 *emulation* kernel (the only bmm-capable
++        # MXFP8 kernel below SM90), which dequantizes it to bf16 at load. The
++        # einsum path multiplies by weight_scale_inv when present, so drop a
++        # leftover scale once the weight is already bf16.
++        wo_a = self.wo_a
++        if not getattr(self, "_dsv41_wo_a_checked", False):
++            assert wo_a.weight.element_size() >= 2, (
++                "wo_a is still 1-byte MXFP8 on SM8x; expected the emulation "
++                "kernel to dequantize it at load"
++            )
++            # The emulation kernel keeps the (now already applied) E8M0
++            # ``weight_scale`` on the layer, and _get_cached_wo_a_bf16 would
++            # multiply the bf16 weight by it a second time (output ~2^-11 too
++            # small, block-wise distorted). Install the bf16 weight as the
++            # cached einsum operand directly so no scale is re-applied.
++            wo_a._dsv4_wo_a_bf16 = (
++                wo_a.weight.data.view(self.n_local_groups, self.o_lora_rank, -1)
++                .to(torch.bfloat16)
++                .contiguous()
++            )
++            self._dsv41_wo_a_checked = True
++        return super()._o_proj(o, positions)
++
++    def prepare_attn_preshuffle(self) -> None:
++        # aiter-only weight preshuffle; keep the plain MXFP8/Marlin linears.
++        self._wqa_wkv_scale = None
++        self._wo_b_scale = None
++
++
++# ---------------------------------------------------------------------------
++# Stage-level dumps (DSV41_DEBUG_DUMP=<dir>, DSV41_DEBUG_DUMP_LAYERS=0,1,2):
++# capture q/kv before and after the fused RoPE insert, the gathered K rows,
++# the sparse-prefill inputs/outputs and the o_proj input/output for small
++# real batches (1 < T <= 64) so ktests/ref_stages.py can compare each stage
++# against the torch reference.
++# ---------------------------------------------------------------------------
++import os as _os
++
++import torch as _torch
++
++
++def _dsv41_dump_dir() -> str:
++    return _os.environ.get("DSV41_DEBUG_DUMP", "")
++
++
++def _dsv41_dump_layers() -> set[int]:
++    s = _os.environ.get("DSV41_DEBUG_DUMP_LAYERS", "0,1,2")
++    return {int(v) for v in s.split(",") if v.strip()}
++
++
++if _dsv41_dump_dir():
++    from vllm.distributed import get_pp_group as _get_pp_group
++    from vllm.forward_context import get_forward_context as _get_fc
++    from vllm.models.deepseek_v4_1.amd import rocm as _rocm_mod
++
++    _STAGE: dict = {}
++
++    def _stage_active(self, num_tokens: int) -> bool:
++        if self.layer_id not in _dsv41_dump_layers() or not (1 < num_tokens <= 64):
++            return False
++        fc = _get_fc()
++        if not isinstance(fc.attn_metadata, dict):
++            return False
++        f = _stage_file(self)
++        return not _os.path.exists(f)
++
++    def _stage_file(self) -> str:
++        rank = _get_pp_group().rank_in_group
++        return f"{_dsv41_dump_dir()}/L{self.layer_id:02d}_r{rank}_stages.pt"
++
++    _orig_insert = DeepseekV41AmpereMLAAttention._fused_qnorm_rope_kv_insert
++
++    def _insert_dump(self, q, kv, positions, attn_metadata):
++        active = _stage_active(self, q.shape[0])
++        if active:
++            _STAGE.clear()
++            _STAGE["layer_id"] = self.layer_id
++            _STAGE["q_pre"] = q.detach().clone().cpu()
++            _STAGE["kv_pre"] = kv.detach().clone().cpu()
++            _STAGE["positions"] = positions.detach().clone().cpu()
++        out = _orig_insert(self, q, kv, positions, attn_metadata)
++        if active:
++            _STAGE["q_rope"] = out.detach().clone().cpu()
++        return out
++
++    DeepseekV41AmpereMLAAttention._fused_qnorm_rope_kv_insert = _insert_dump
++
++    _orig_prefill = _rocm_mod.rocm_sparse_attn_prefill
++
++    def _prefill_dump(q, kv, indices, topk_length, scale, head_dim, nope_head_dim,
++                      rope_head_dim, attn_sink, output, **kw):
++        _orig_prefill(q, kv, indices, topk_length, scale, head_dim, nope_head_dim,
++                      rope_head_dim, attn_sink, output, **kw)
++        if _STAGE.get("q_rope") is not None and "attn_o" not in _STAGE:
++            idx = indices.reshape(indices.shape[0], -1)
++            _STAGE["prefill_q"] = q.detach().clone().cpu()
++            _STAGE["prefill_indices"] = idx.detach().clone().cpu()
++            _STAGE["prefill_lens"] = None if topk_length is None else topk_length.detach().clone().cpu()
++            used = idx[idx >= 0].unique()
++            kv2 = kv.reshape(-1, kv.shape[-1])
++            _STAGE["prefill_kv_rows"] = used.cpu()
++            _STAGE["prefill_kv"] = kv2[used].detach().clone().cpu()
++            _STAGE["scale"] = float(scale)
++            _STAGE["attn_sink"] = None if attn_sink is None else attn_sink.detach().clone().cpu()
++            _STAGE["attn_o"] = output.detach().clone().cpu()
++
++    _rocm_mod.rocm_sparse_attn_prefill = _prefill_dump
++
++    _orig_o_proj = DeepseekV41AmpereMLAAttention._o_proj
++
++    def _o_proj_dump(self, o, positions):
++        res = _orig_o_proj(self, o, positions)
++        if _STAGE.get("layer_id") == self.layer_id and "attn_o" in _STAGE and "o_proj_out" not in _STAGE:
++            _STAGE["o_proj_in"] = o.detach().clone().cpu()
++            _STAGE["o_proj_out"] = res.detach().clone().cpu()
++            _STAGE["wo_a_dtype"] = str(self.wo_a.weight.dtype)
++            f = _stage_file(self)
++            _os.makedirs(_os.path.dirname(f), exist_ok=True)
++            _torch.save(dict(_STAGE), f)
++            _STAGE.clear()
++        return res
++
++    DeepseekV41AmpereMLAAttention._o_proj = _o_proj_dump
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/ampere/__init__.py vllm/models/deepseek_v4_1/ampere/__init__.py
+--- image-official/models/deepseek_v4_1/ampere/__init__.py	1969-12-31 16:00:00.000000000 -0800
++++ vllm/models/deepseek_v4_1/ampere/__init__.py	2026-09-10 15:49:59.329099871 -0700
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/attention.py vllm/models/deepseek_v4_1/attention.py
+--- image-official/models/deepseek_v4_1/attention.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/models/deepseek_v4_1/attention.py	2026-09-10 16:12:53.075026052 -0700
+@@ -1115,6 +1115,7 @@
+             self.topk_indices_buffer,
+             skip_k_cache_insert=True,
+             use_fp4_cache=self.use_fp4_kv,
++            num_heads=self.n_head,
+             compress_ratio=self.compress_ratio,
+             candidate_blocks=candidate_block_buffer,
+             candidate_block_size=candidate_block_size,
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/common/engram.py vllm/models/deepseek_v4_1/common/engram.py
+--- image-official/models/deepseek_v4_1/common/engram.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/models/deepseek_v4_1/common/engram.py	2026-09-10 16:12:52.981819670 -0700
+@@ -60,6 +60,13 @@
+ 
+ logger = init_logger(__name__)
+ 
++# DSV41_ENGRAM_SSD: tables served from the checkpoint shards on the NVMe (overlay).
++import os as _os
++
++
++def _engram_storage() -> str:
++    return _os.environ.get("DSV41_ENGRAM_STORAGE", "host").strip().lower()
++
+ # Cache value for tokens that take no part in an n-gram (image spans).
+ DEAD_ID = -1
+ 
+@@ -605,6 +612,17 @@
+     return dp_group.all_gather(hash_ids, dim=0)
+ 
+ 
++def _engram_ssd_weight_loader(
++    param: torch.nn.Parameter, loaded_weight: torch.Tensor
++) -> None:
++    """SSD storage: the table stays in the shard; only check the checkpoint shape."""
++    rows = param.engram_expected_rows
++    if loaded_weight.shape[0] != rows:
++        raise ValueError(
++            f"engram table has {loaded_weight.shape[0]} rows, config says {rows}"
++        )
++
++
+ def _engram_head_shard_weight_loader(
+     param: torch.nn.Parameter, loaded_weight: torch.Tensor
+ ) -> None:
+@@ -704,6 +722,10 @@
+         dp_size = get_engram_dp_size()
+         assert head_sizes and all(size > 0 for size in head_sizes)
+         assert sum(head_sizes) <= num_embeddings
++        self.ssd_table = None
++        self._ssd = _engram_storage() == "ssd"
++        if self._ssd:
++            cpu_offload = False
+         if cpu_offload and not is_uva_available():
+             raise RuntimeError("Engram CPU offload requires UVA support")
+         self.num_embeddings = num_embeddings
+@@ -733,29 +755,41 @@
+         # Explicit device: model init runs under a `torch.device("cuda")`
+         # context, which would otherwise put the shard in HBM.
+         kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
++        table_rows = 0 if self._ssd else self.part_num_embeddings
+         self.weight = nn.Parameter(
+             torch.empty(
+-                self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
++                table_rows, dim, dtype=torch.float8_e4m3fn, **kwargs
+             ),
+             requires_grad=False,
+         )
+         self.weight_scale_inv = nn.Parameter(
+             torch.empty(
+-                self.part_num_embeddings,
++                table_rows,
+                 dim // block_size,
+                 dtype=torch.uint8,
+                 **kwargs,
+             ),
+             requires_grad=False,
+         )
+-        for param in (self.weight, self.weight_scale_inv):
+-            set_weight_attrs(
+-                param,
+-                {
+-                    "weight_loader": _engram_head_shard_weight_loader,
+-                    "engram_vocab_start": self.vocab_start_idx,
+-                },
+-            )
++        if self._ssd:
++            # The loader must never copy the 95 GiB table: validate and drop.
++            for param in (self.weight, self.weight_scale_inv):
++                set_weight_attrs(
++                    param,
++                    {
++                        "weight_loader": _engram_ssd_weight_loader,
++                        "engram_expected_rows": num_embeddings,
++                    },
++                )
++        if not self._ssd:
++            for param in (self.weight, self.weight_scale_inv):
++                set_weight_attrs(
++                    param,
++                    {
++                        "weight_loader": _engram_head_shard_weight_loader,
++                        "engram_vocab_start": self.vocab_start_idx,
++                    },
++                )
+         if cpu_offload:
+             logger.info(
+                 "Engram table offloaded to pinned host memory: %d rows x %d, "
+@@ -783,6 +817,25 @@
+         assert self._views is not None
+         return self._views
+ 
++    def attach_ssd(self, model_dir: str, layer_id: int, max_tokens: int) -> None:
++        """SSD storage: open the shard that holds this layer's table."""
++        if not self._ssd:
++            return
++        from engram_ssd.engram_ssd import SsdEngramTable
++
++        self.ssd_table = SsdEngramTable(
++            model_dir,
++            layer_id,
++            self.vocab_start_idx,
++            self.vocab_end_idx,
++            self.head_start,
++            self.part_n_hash_cols,
++            self.n_hash_cols,
++            dim=self.dim,
++            block_size=self.block_size,
++            max_tokens=max_tokens,
++        )
++
+     def lookup(
+         self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
+     ) -> None:
+@@ -793,6 +846,10 @@
+         rows = indices.shape[0] * self.part_n_hash_cols
+         if not rows:
+             return
++        if self._ssd:
++            assert self.ssd_table is not None, "attach_ssd() not called"
++            self.ssd_table.lookup(indices, out)
++            return
+         weight, scales = self._storage()
+         # The table dwarfs TLB reach, so a persistent grid near the SM count
+         # beats one program per row; halve it to leave SMs for the main stream.
+@@ -1052,6 +1109,11 @@
+ 
+         vllm_config = get_current_vllm_config()
+         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
++        if self.embed_tokens._ssd:
++            _model_dir = _os.environ.get("DSV41_MODEL_DIR") or get_current_vllm_config().model_config.model
++            self.embed_tokens.attach_ssd(
++                _model_dir, layout.layer_ids[layer_hash_index], max_tokens
++            )
+         # Keep lookup results alive across breakable graph segments. A table
+         # shared by DP replicas stages every replica's tokens at once.
+         self.staged_rows = torch.empty(
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/common/ops/cache_utils.py vllm/models/deepseek_v4_1/common/ops/cache_utils.py
+--- image-official/models/deepseek_v4_1/common/ops/cache_utils.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/models/deepseek_v4_1/common/ops/cache_utils.py	2026-09-10 16:12:53.018869254 -0700
+@@ -34,6 +34,12 @@
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.import_utils import has_cutedsl
++from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_fp8_u8
++
++
++def is_cutedsl_supported() -> bool:
++    # CuTe DSL kernels target SM90+; compiling them for SM8x aborts the process.
++    return has_cutedsl() and current_platform.has_device_capability(90)
+ from vllm.utils.math_utils import next_power_of_2
+ 
+ 
+@@ -134,11 +140,7 @@
+             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
+ 
+             # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
+-            if use_fnuz:
+-                x_fp8 = x_clamped.to(tl.float8e4b8)
+-            else:
+-                x_fp8 = x_clamped.to(tl.float8e4nv)
+-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
++            x_uint8 = _encode_fp8_u8(x_clamped, use_fnuz)
+ 
+             # Store as uint8 (1 byte each)
+             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
+@@ -310,13 +312,7 @@
+                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
+ 
+                 # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
+-                if use_fnuz:
+-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-                else:
+-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+-
+-                # Convert fp8 to float32 for computation
+-                x_float = x_fp8.to(tl.float32)
++                x_float = _decode_fp8_f32(x_uint8, use_fnuz)
+ 
+                 # Load and decode UE8M0 scale
+                 # UE8M0: scale = 2^(stored_value - 127)
+@@ -413,7 +409,7 @@
+     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
+     writes FNUZ on gfx942 and OCP on gfx950).
+     """
+-    if has_cutedsl():
++    if is_cutedsl_supported():
+         # lazily import, otherwise some tests fail due to CUDA driver init failure.
+         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
+             dequantize_and_gather_k_cache_cutedsl,
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/common/ops/fused_compress_quant_cache.py vllm/models/deepseek_v4_1/common/ops/fused_compress_quant_cache.py
+--- image-official/models/deepseek_v4_1/common/ops/fused_compress_quant_cache.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/models/deepseek_v4_1/common/ops/fused_compress_quant_cache.py	2026-09-10 16:12:53.019024995 -0700
+@@ -6,6 +6,7 @@
+ 
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
++from vllm.v1.attention.ops.fp8_sm80 import _encode_e4m3fn_u8
+ 
+ if current_platform.is_rocm():
+     from vllm.platforms.rocm import _ON_GFX950
+@@ -317,7 +318,7 @@
+     amax = tl.maximum(tl.max(tl.abs(quant), 1), 1e-4)
+     exponent = tl.ceil(tl.log2(amax * (1.0 / 448.0)))
+     scaled = quant * tl.reshape(tl.exp2(-exponent), (8, 1))
+-    fp8 = tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv)
++    fp8 = _encode_e4m3fn_u8(tl.clamp(scaled, -448.0, 448.0))
+     packed = tl.reshape(fp8.to(tl.uint8, bitcast=True), (512,))
+     tl.store(values + d, packed, d < 448)
+     s = tl.arange(0, 8)
+@@ -378,6 +379,6 @@
+     )
+     if STORE_FP8:
+         scaled = row.to(tl.float32) * (1.0 / tl.load(fp8_scale))
+-        tl.store(dst + d, tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv))
++        tl.store(dst + d, _encode_e4m3fn_u8(tl.clamp(scaled, -448.0, 448.0)))
+     else:
+         tl.store(dst + d, row)
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/common/ops/indexer_k_store.py vllm/models/deepseek_v4_1/common/ops/indexer_k_store.py
+--- image-official/models/deepseek_v4_1/common/ops/indexer_k_store.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/models/deepseek_v4_1/common/ops/indexer_k_store.py	2026-09-10 16:12:53.019374772 -0700
+@@ -17,6 +17,7 @@
+ 
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
++from vllm.v1.attention.ops.fp8_sm80 import _encode_e4m3fn_u8
+ 
+ from . import MXFP4_BLOCK_SIZE, _fp32x2_to_fp4x2
+ 
+@@ -241,7 +242,7 @@
+         exponent = tl.ceil(tl.log2(absmax * INV_FP8_MAX))
+         inv_scale = tl.exp2(-exponent)
+         x_clamped = tl.clamp(result_bf16 * inv_scale, -FP8_MAX, FP8_MAX)
+-        x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
++        x_uint8 = _encode_e4m3fn_u8(x_clamped)
+         if SHUFFLE:
+             tiled = (
+                 block // HEAD_TILE_SIZE * BLOCK_TILE_SIZE * HEAD_TILE_SIZE
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/nvidia/model.py vllm/models/deepseek_v4_1/nvidia/model.py
+--- image-official/models/deepseek_v4_1/nvidia/model.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/models/deepseek_v4_1/nvidia/model.py	2026-09-11 10:07:45.798943871 -0700
+@@ -24,6 +24,29 @@
+     mhc_pre_delayed_tilelang,
+ )
+ from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
++
++
++def _dsv41_mhc_pre_torch(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
++                         hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
++                         pre_mix=None, x=None, norm_weight=None, norm_eps=1e-6):
++    from vllm.model_executor.kernels.mhc.torch import mhc_pre_delayed_torch
++
++    post, comb, layer_input, pre = mhc_pre_delayed_torch(
++        residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
++        hc_post_mult_value, sinkhorn_repeat, pre_mix=pre_mix, x=x,
++    )
++    if norm_weight is not None:
++        h = layer_input.float()
++        h = h * torch.rsqrt(h.square().mean(-1, keepdim=True) + norm_eps)
++        layer_input = (h * norm_weight.float()).to(residual.dtype)
++    return post.contiguous(), comb.contiguous(), layer_input.contiguous(), pre.contiguous()
++
++
++if __import__("os").environ.get("DSV41_MHC_TORCH") == "1":
++    from vllm.model_executor.kernels.mhc.torch import mhc_post_torch as _dsv41_mhc_post_torch
++
++    mhc_pre_delayed_tilelang = _dsv41_mhc_pre_torch  # noqa: F811
++    mhc_post_tilelang = _dsv41_mhc_post_torch  # noqa: F811
+ from vllm.model_executor.layers.fused_moe import (
+     fused_moe_make_expert_params_mapping,
+ )
+@@ -73,6 +96,130 @@
+ from vllm.sequence import IntermediateTensors
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
++import os as _dsv41_os
++
++
++def _dsv41_dbg_stats() -> bool:
++    return _dsv41_os.environ.get("DSV41_DEBUG_STATS") == "1"
++
++
++import time as _dsv41_time
++
++
++def _dsv41_dbg_timing() -> bool:
++    return _dsv41_os.environ.get("DSV41_DEBUG_TIMING") == "1"
++
++
++def _dsv41_gdump_dir() -> str:
++    return _dsv41_os.environ.get("DSV41_DEBUG_GDUMP", "")
++
++
++import ctypes as _dsv41_C
++
++_DSV41_GD_CB = _dsv41_C.CFUNCTYPE(None, _dsv41_C.c_void_p)
++_dsv41_gd_cudart = None
++
++
++_DSV41_GD_STATE: dict = {}
++
++
++def _dsv41_gdump_layer(model, idx, hidden_states):
++    _dsv41_gdump_tensor(f"L{idx:02d}", hidden_states)
++
++
++def _dsv41_gdump_tensor(key, hidden_states):
++    """Graph-safe per-layer dump: D2H copy into a pinned buffer plus a cudaLaunchHostFunc
++    callback that writes it to disk, so it also fires on CUDA-graph replay (the ordinary
++    forward hooks do not). Files: <dir>/G<call>_L<idx>_r<rank>.npy (bf16 bits as int16)."""
++    global _dsv41_gd_cudart
++    import numpy as _np
++
++    T = hidden_states.shape[0]
++    if T > 64:
++        return
++    st = _DSV41_GD_STATE
++    idx = key
++    if idx not in st:
++        if torch.cuda.is_current_stream_capturing():
++            return  # buffers must exist before capture (warmup allocates them)
++        buf = torch.empty((64, hidden_states[0].numel()), dtype=hidden_states.dtype, device="cpu", pin_memory=True)
++        rank = get_pp_group().rank_in_group
++        d = _dsv41_gdump_dir()
++        counter = [0]
++        shape = tuple(hidden_states.shape[1:])
++
++        def cb(_):
++            n = counter[0]
++            counter[0] += 1
++            arr = buf.view(torch.int16).numpy() if buf.dtype == torch.bfloat16 else buf.numpy()
++            _np.save(f"{d}/G{n:03d}_{idx}_r{rank}.npy", arr.copy())
++
++        st[idx] = (buf, _DSV41_GD_CB(cb), shape)
++        _dsv41_os.makedirs(d, exist_ok=True)
++    buf, cbp, _ = st[idx]
++    buf[:T].copy_(hidden_states.reshape(T, -1), non_blocking=True)
++    if T < 64:
++        buf[T:].zero_()
++    if _dsv41_gd_cudart is None:
++        try:
++            _dsv41_gd_cudart = _dsv41_C.CDLL("libcudart.so.13")
++        except OSError:
++            _dsv41_gd_cudart = _dsv41_C.CDLL("libcudart.so.12")
++        _dsv41_gd_cudart.cudaLaunchHostFunc.restype = _dsv41_C.c_int
++        _dsv41_gd_cudart.cudaLaunchHostFunc.argtypes = [_dsv41_C.c_void_p, _dsv41_C.c_void_p, _dsv41_C.c_void_p]
++    stream = torch.cuda.current_stream(hidden_states.device).cuda_stream
++    _dsv41_gd_cudart.cudaLaunchHostFunc(stream, _dsv41_C.cast(cbp, _dsv41_C.c_void_p), None)
++
++
++def _dsv41_dbg_dump_dir() -> str:
++    return _dsv41_os.environ.get("DSV41_DEBUG_DUMP", "")
++
++
++def _dsv41_install_dump_hooks(model) -> None:
++    d = _dsv41_dbg_dump_dir()
++    rank = get_pp_group().rank_in_group
++
++    def _ok(x):
++        return (
++            1 < x.shape[0] <= 64
++            and is_forward_context_available()
++            and isinstance(get_forward_context().attn_metadata, dict)
++        )
++
++    def _mk(idx, kind):
++        def hook(mod, args, out):
++            x = args[1] if kind == "attn" else args[0]
++            if not torch.is_tensor(x) or not _ok(x):
++                return
++            f = f"{d}/L{idx:02d}_r{rank}_{kind}.pt"
++            if _dsv41_os.path.exists(f):
++                return
++            _dsv41_os.makedirs(d, exist_ok=True)
++            rec = {"x": x.detach().cpu(), "out": out.detach().cpu()}
++            if kind == "attn":
++                rec["positions"] = args[0].detach().cpu()
++            else:
++                rec["input_ids"] = args[1].detach().cpu() if len(args) > 1 and torch.is_tensor(args[1]) else None
++            torch.save(rec, f)
++        return hook
++
++    for idx, layer in enumerate(model.layers):
++        if not hasattr(layer, "attn"):
++            continue
++        layer.attn.register_forward_hook(_mk(idx, "attn"))
++        layer.ffn.register_forward_hook(_mk(idx, "ffn"))
++from hybrid.pp_shadow import (
++    CAND_KEY as _DSV41_CAND_KEY,
++    SRC_KEY as _DSV41_SRC_KEY,
++    PPShadowPlan as _DSV41PPShadowPlan,
++    ShadowSource as _DSV41ShadowSource,
++    remap_shadow_weight_name as _dsv41_remap_shadow_weight_name,
++)
++from hybrid.cpu_experts import (
++    install_cpu_experts as _dsv41_install_cpu_experts,
++    is_cpu_expert_weight as _dsv41_is_cpu_expert_weight,
++    load_cpu_expert_weights as _dsv41_load_cpu_expert_weights,
++)
+ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+ 
+ from ..common.engram import (
+@@ -127,6 +274,17 @@
+     """
+     backend = vllm_config.attention_config.backend
+     device_capability = current_platform.get_device_capability()
++    if device_capability is not None and device_capability.major == 8:
++        if backend is not None and backend.name != "TRITON_MLA_SPARSE_DSV41":
++            raise ValueError(
++                f"{backend.name} is not supported for DeepSeek V4.1 on SM8x; "
++                "use TRITON_MLA_SPARSE_DSV41 (default)."
++            )
++        from vllm.models.deepseek_v4_1.ampere.ampere_sparse import (
++            DeepseekV41AmpereMLAAttention,
++        )
++
++        return DeepseekV41AmpereMLAAttention
+     if backend in (
+         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
+         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
+@@ -345,11 +503,16 @@
+                 # Engram injection happens between the previous sublayer's
+                 # post and this block's pre, on the full hc stream, so the
+                 # mix coefficients see the injected stream.
++                if _dsv41_gdump_dir():
++                    _dsv41_gdump_tensor(f"EG{self.engram.layer_hash_index}hash", engram_hashes[:, self.engram.layer_hash_index].contiguous())
++                    _dsv41_gdump_tensor(f"EG{self.engram.layer_hash_index}in", residual)
+                 residual = self.engram(
+                     residual,
+                     engram_hashes[:, self.engram.layer_hash_index],
+                     engram_mask,
+                 )
++                if _dsv41_gdump_dir():
++                    _dsv41_gdump_tensor(f"EG{self.engram.layer_hash_index}out", residual)
+             post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
+                 residual,
+                 self.hc_attn_fn,
+@@ -368,7 +531,14 @@
+         if self.use_sequence_parallel:
+             x = sp_all_gather(x)[: positions.shape[0]]
+ 
++        if getattr(self, "_dsv41_ship_attn_input", False):
++            self._dsv41_shipped_x = x
++        _gi = getattr(self, "_dsv41_idx", -1)
++        if _dsv41_gdump_dir() and 0 <= _gi < 3:
++            _dsv41_gdump_tensor(f"A{_gi:02d}in", x)
+         x = self.attn(positions, x, None)
++        if _dsv41_gdump_dir() and 0 <= _gi < 3:
++            _dsv41_gdump_tensor(f"A{_gi:02d}out", x)
+         if self.use_sequence_parallel:
+             x = sp_reduce_scatter(x)
+ 
+@@ -387,7 +557,11 @@
+             norm_weight=self.ffn_norm.weight,
+             norm_eps=self.ffn_norm.variance_epsilon,
+         )
++        if _dsv41_gdump_dir() and 0 <= _gi < 3:
++            _dsv41_gdump_tensor(f"F{_gi:02d}in", x)
+         x = self.ffn(x, input_ids)
++        if _dsv41_gdump_dir() and 0 <= _gi < 3:
++            _dsv41_gdump_tensor(f"F{_gi:02d}out", x)
+         return x, residual, post_mix, res_mix, ffn_pre
+ 
+ 
+@@ -454,6 +628,28 @@
+ 
+         self.engram_layout = EngramLayout.from_config(config)
+ 
++        # PP cuts inside kv-sharing groups (overlay): shadow kv sources.
++        from vllm.distributed.utils import get_pp_indices as _dsv41_get_pp_indices
++
++        _pp_start, _pp_end = _dsv41_get_pp_indices(
++            config.num_hidden_layers,
++            get_pp_group().rank_in_group,
++            get_pp_group().world_size,
++        )
++        self._pp_plan = _DSV41PPShadowPlan(
++            config, config.num_hidden_layers, _pp_start, _pp_end
++        )
++        self.shadow_sources = nn.ModuleDict()
++        for s in self._pp_plan.shadow_ids:
++            attn = _select_dsv4_attn_cls(vllm_config)(
++                vllm_config,
++                prefix=f"{prefix}.layers.{s}.attn",
++                topk_indices_buffer=self.topk_indices_buffer,
++                aux_stream_list=aux_stream_list,
++                candidate_block_buffer=self.candidate_block_buffer,
++            )
++            self.shadow_sources[str(s)] = _DSV41ShadowSource(attn, s)
++
+         self.start_layer, self.end_layer, self.layers = make_layers(
+             config.num_hidden_layers,
+             lambda prefix: DeepseekV4DecoderLayer(
+@@ -467,6 +663,13 @@
+             prefix=f"{prefix}.layers",
+         )
+ 
++        assert (self.start_layer, self.end_layer) == (_pp_start, _pp_end)
++        for s in self._pp_plan.owned_ship_ids:
++            self.layers[s]._dsv41_ship_attn_input = True
++
++        if _dsv41_dbg_dump_dir():
++            _dsv41_install_dump_hooks(self)
++
+         # The n-gram hash needs a slot-keyed rolling store of compressed ids
+         # (chunked prefill / decode lookback); key it off the first local
+         # layer's sliding-window KV cache. Only PP ranks owning an engram
+@@ -521,20 +724,29 @@
+         # layer and keeps that shape until the final hc collapse — plus the
+         # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
+         # for its attention collapse.
+-        return IntermediateTensors(
+-            {
+-                "hidden_states": torch.zeros(
+-                    (batch_size, self.hc_mult, self.config.hidden_size),
+-                    dtype=dtype,
+-                    device=device,
+-                ),
+-                "pre_mix": torch.zeros(
+-                    (batch_size, self.hc_mult),
+-                    dtype=torch.float32,
+-                    device=device,
+-                ),
+-            }
+-        )
++        tensors = {
++            "hidden_states": torch.zeros(
++                (batch_size, self.hc_mult, self.config.hidden_size),
++                dtype=dtype,
++                device=device,
++            ),
++            "pre_mix": torch.zeros(
++                (batch_size, self.hc_mult),
++                dtype=torch.float32,
++                device=device,
++            ),
++        }
++        plan = self._pp_plan
++        # Declare exactly what the previous rank sends (dummy runs read these).
++        for s in plan.recv_ids:
++            tensors[_DSV41_SRC_KEY.format(s)] = torch.zeros(
++                (batch_size, self.config.hidden_size), dtype=dtype, device=device
++            )
++        if plan.ship_cand or plan.recv_cand:
++            tensors[_DSV41_CAND_KEY] = torch.zeros(
++                (batch_size, plan.cand_blocks), dtype=torch.int32, device=device
++            )
++        return IntermediateTensors(tensors)
+ 
+     def forward(
+         self,
+@@ -543,6 +755,7 @@
+         intermediate_tensors: IntermediateTensors | None,
+         inputs_embeds: torch.Tensor | None = None,
+         lookback_token_ids: torch.Tensor | None = None,
++        engram_static_meta: tuple | None = None,
+     ) -> torch.Tensor | IntermediateTensors:
+         if get_pp_group().is_first_rank:
+             if inputs_embeds is not None:
+@@ -570,11 +783,31 @@
+             attn_metadata = get_forward_context().attn_metadata
+             if isinstance(attn_metadata, list):
+                 attn_metadata = attn_metadata[dbo_current_ubatch_id()]
+-            if isinstance(attn_metadata, dict) and self.engram_hash.ensure_cache():
++            # dsv41: engram static meta -- under PIECEWISE capture there is no
++            # attention metadata; use the runner's static buffers instead.
++            _dsv41_static = None
++            if not isinstance(attn_metadata, dict) and engram_static_meta is not None:
++                _dsv41_static = engram_static_meta
++            if (isinstance(attn_metadata, dict) or _dsv41_static is not None) and self.engram_hash.ensure_cache():
+                 assert self.engram_swa_prefix is not None
+-                swa_metadata = typing.cast(
+-                    "DeepseekSparseSWAMetadata", attn_metadata[self.engram_swa_prefix]
+-                )
++                if _dsv41_static is not None:
++                    _qsl, _slot, _bt = _dsv41_static
++                    swa_metadata = typing.cast("DeepseekSparseSWAMetadata", None)
++                    _num_reqs = _qsl.shape[0] - 1
++                else:
++                    swa_metadata = typing.cast(
++                        "DeepseekSparseSWAMetadata", attn_metadata[self.engram_swa_prefix]
++                    )
++                    _qsl, _slot, _bt = swa_metadata.query_start_loc, swa_metadata.slot_mapping, swa_metadata.block_table
++                    _num_reqs = swa_metadata.num_decodes + swa_metadata.num_prefills
++                    if engram_static_meta is not None and _dsv41_os.environ.get("DSV41_DEBUG_ENGRAM") == "1":
++                        _sq, _ss, _sb = engram_static_meta
++                        _T = input_ids.shape[0]
++                        _msg = []
++                        if not torch.equal(_sq[: _qsl.shape[0]], _qsl): _msg.append(f"qsl static {_sq[:_qsl.shape[0]+1].tolist()} vs meta {_qsl.tolist()}")
++                        if not torch.equal(_ss[:_T], _slot[:_T]): _msg.append(f"slot static {_ss[:_T].tolist()} vs meta {_slot[:_T].tolist()}")
++                        if _sb.data_ptr() != _bt.data_ptr() or _sb.stride(0) != _bt.stride(0): _msg.append(f"block_table static ptr/stride {_sb.data_ptr()}/{_sb.stride(0)} shape {tuple(_sb.shape)} vs meta {_bt.data_ptr()}/{_bt.stride(0)} shape {tuple(_bt.shape)} row0 static {_sb[0,:3].tolist()} meta {_bt[0,:3].tolist()}")
++                        logger.info("DSV41 ENGRAM-META T=%d hashblock=%d %s", _T, self.engram_hash.block_size, "; ".join(_msg) if _msg else "static == meta")
+                 # Image-span tokens are dead: they break n-grams (hash op
+                 # takes True=dead) and their gate is zeroed (Engram.forward
+                 # takes True=keep).
+@@ -586,19 +819,19 @@
+                             "engram needs `lookback_token_ids` from the model "
+                             "runner (the DBO/ubatch wrapper drops model kwargs)"
+                         )
+-                    num_reqs = swa_metadata.num_decodes + swa_metadata.num_prefills
++                    num_reqs = _num_reqs
+                     lookback_token_ids = input_ids.new_full(
+                         (num_reqs, self.engram_hash.lookback_depth), -1
+                     )
+                 engram_hashes = self.engram_hash(
+                     input_ids,
+                     positions,
+-                    swa_metadata.query_start_loc,
++                    _qsl,
+                     image_mask,
+                     lookback_token_ids,
+                     image_sentinel_mask(lookback_token_ids),
+-                    swa_metadata.slot_mapping,
+-                    swa_metadata.block_table,
++                    _slot[: input_ids.shape[0]],
++                    _bt,
+                 )
+             elif get_engram_dp_size() > 1:
+                 # The lookup is collective once DP replicas share a table, so
+@@ -630,12 +863,26 @@
+         if not get_pp_group().is_first_rank:
+             assert intermediate_tensors is not None
+             pre_mix = intermediate_tensors["pre_mix"]
++            plan = self._pp_plan
++            num_tokens = positions.shape[0]
++            if plan.recv_cand:
++                self.candidate_block_buffer[:num_tokens].copy_(
++                    intermediate_tensors[_DSV41_CAND_KEY][:num_tokens]
++                )
++            for s in plan.shadow_ids:
++                self.shadow_sources[str(s)].run(
++                    intermediate_tensors[_DSV41_SRC_KEY.format(s)][:num_tokens],
++                    positions,
++                    plan.shadow_needs[s],
++                )
+         aux_hidden_states: list[torch.Tensor] = []
+         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+         for idx, layer in enumerate(
+             islice(self.layers, self.start_layer, self.end_layer),
+             start=self.start_layer,
+         ):
++            if _dsv41_gdump_dir():
++                layer._dsv41_idx = idx
+             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
+                 hidden_states,
+                 positions,
+@@ -647,6 +894,40 @@
+                 engram_hashes,
+                 engram_mask,
+             )
++            if _dsv41_dbg_dump_dir() and 1 < positions.shape[0] <= 64 and is_forward_context_available() and isinstance(get_forward_context().attn_metadata, dict):
++                _d = _dsv41_dbg_dump_dir()
++                _dsv41_os.makedirs(_d, exist_ok=True)
++                _tag = f"L{idx:02d}_r{get_pp_group().rank_in_group}"
++                if not _dsv41_os.path.exists(f"{_d}/{_tag}.pt"):
++                    torch.save(
++                        {"hidden_states": hidden_states.detach().cpu(),
++                         "residual": residual.detach().cpu() if residual is not None else None,
++                         "pre_mix": pre_mix.detach().cpu() if pre_mix is not None else None,
++                         "post_mix": post_mix.detach().cpu() if post_mix is not None else None,
++                         "res_mix": res_mix.detach().cpu() if res_mix is not None else None,
++                         "positions": positions.detach().cpu(),
++                         "input_ids": input_ids.detach().cpu() if input_ids is not None else None},
++                        f"{_d}/{_tag}.pt")
++            if _dsv41_gdump_dir():
++                _dsv41_gdump_layer(self, idx, hidden_states)
++            if _dsv41_dbg_timing():
++                torch.cuda.synchronize()
++                _now = _dsv41_time.perf_counter()
++                if idx == self.start_layer:
++                    self._dsv41_t_prev = _now; self._dsv41_t_first = _now
++                    self._dsv41_tick = getattr(self, "_dsv41_tick", 0) + 1
++                if hidden_states.shape[0] == 1 and self._dsv41_tick % 16 == 0:
++                    logger.info("TIMING L%d T=%d layer %.2f ms cum %.2f ms", idx, hidden_states.shape[0],
++                                (_now - self._dsv41_t_prev) * 1e3, (_now - self._dsv41_t_first) * 1e3)
++                self._dsv41_t_prev = _now
++            if _dsv41_dbg_stats():
++                _h = hidden_states.float()
++                _r = residual.float() if residual is not None else _h
++                logger.info(
++                    "DBG L%d T=%d h mean|.|=%.4f max=%.2f nan=%d | res mean|.|=%.4f max=%.2f",
++                    idx, _h.shape[0], _h.abs().mean().item(), _h.abs().max().item(),
++                    int(torch.isnan(_h).sum().item()), _r.abs().mean().item(), _r.abs().max().item(),
++                )
+             if idx + 1 in self.aux_hidden_state_layers:
+                 # Reconstruct the aux hidden state for draft models
+                 aux_recon = mhc_post_tilelang(
+@@ -667,9 +948,20 @@
+                 )
+ 
+         if not get_pp_group().is_last_rank:
+-            return IntermediateTensors(
+-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
+-            )
++            out = {"hidden_states": hidden_states, "pre_mix": pre_mix}
++            plan = self._pp_plan
++            num_tokens = positions.shape[0]
++            for s in plan.ship_ids:
++                key = _DSV41_SRC_KEY.format(s)
++                if s in plan.owned_ship_ids:
++                    out[key] = self.layers[s]._dsv41_shipped_x
++                else:
++                    assert intermediate_tensors is not None
++                    out[key] = intermediate_tensors[key][:num_tokens]
++            if plan.ship_cand:
++                assert self.candidate_block_buffer is not None
++                out[_DSV41_CAND_KEY] = self.candidate_block_buffer[:num_tokens]
++            return IntermediateTensors(out)
+ 
+         # MTP needs full HC states; otherwise collapse and normalize locally
+         # before gathering to reduce communication.
+@@ -726,6 +1018,9 @@
+         )
+ 
+         for name, loaded_weight in weights:
++            name = _dsv41_remap_shadow_weight_name(name, self._pp_plan.shadow_ids)
++            if _dsv41_is_cpu_expert_weight(name):
++                continue  # served by kt-kernel straight from the shards
+             if name.startswith(("vision.", "aligner.", "image_")):
+                 # Vision weights are loaded by the outer multimodal wrapper.
+                 logger.warning_once("Skipping non-text weight: %s", name)
+@@ -1038,6 +1333,7 @@
+         )
+ 
+         self.set_moe_parameters()
++        _dsv41_install_cpu_experts(self, vllm_config)
+ 
+     def set_moe_parameters(self) -> None:
+         self.num_expert_groups = getattr(self.config, "n_group", 1)
+@@ -1094,6 +1390,7 @@
+         intermediate_tensors: IntermediateTensors | None = None,
+         inputs_embeds: torch.Tensor | None = None,
+         lookback_token_ids: torch.Tensor | None = None,
++        engram_static_meta: tuple | None = None,
+     ) -> torch.Tensor | IntermediateTensors:
+         hidden_states = self.model(
+             input_ids,
+@@ -1101,6 +1398,7 @@
+             intermediate_tensors,
+             inputs_embeds,
+             lookback_token_ids=lookback_token_ids,
++            engram_static_meta=engram_static_meta,
+         )
+         return hidden_states
+ 
+@@ -1119,6 +1417,7 @@
+     def process_weights_after_loading(self) -> None:
+         self.model.finalize_mega_moe_weights()
+         self.model.finalize_mhc_broadcast_weights()
++        _dsv41_load_cpu_expert_weights(self)
+ 
+     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+         return self.model.get_expert_mapping()
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/models/deepseek_v4_1/nvidia/vl_model.py vllm/models/deepseek_v4_1/nvidia/vl_model.py
+--- image-official/models/deepseek_v4_1/nvidia/vl_model.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/models/deepseek_v4_1/nvidia/vl_model.py	2026-09-11 08:44:20.892950860 -0700
+@@ -312,6 +312,7 @@
+         intermediate_tensors=None,
+         inputs_embeds: torch.Tensor | None = None,
+         lookback_token_ids: torch.Tensor | None = None,
++        engram_static_meta: tuple | None = None,
+         **kwargs,
+     ) -> torch.Tensor:
+         return self.language_model(
+@@ -320,6 +321,7 @@
+             intermediate_tensors,
+             inputs_embeds,
+             lookback_token_ids=lookback_token_ids,
++            engram_static_meta=engram_static_meta,
+         )
+ 
+     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/utils/multi_stream_utils.py vllm/utils/multi_stream_utils.py
+--- image-official/utils/multi_stream_utils.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/utils/multi_stream_utils.py	2026-09-10 16:15:26.271952064 -0700
+@@ -101,6 +101,14 @@
+         Tuple of (default_result, aux_results) where aux_results[i] is the
+         result of aux_fns[i] (or None when skipped).
+     """
++    if aux_streams is not None and enable:
++        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
++
++        # Same rule as maybe_execute_in_parallel: no side-stream forks while
++        # a breakable capture is recording the surrounding segment.
++        if BreakableCUDAGraphCapture.is_active():
++            aux_streams = None
++
+     aux_results: list[Any]
+     if aux_streams is None or not enable:
+         default_result = default_fn()
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/attention/backends/mla/indexer.py vllm/v1/attention/backends/mla/indexer.py
+--- image-official/v1/attention/backends/mla/indexer.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/v1/attention/backends/mla/indexer.py	2026-09-10 21:10:16.419375812 -0700
+@@ -22,6 +22,7 @@
+ from vllm.utils.deep_gemm import (
+     get_paged_mqa_logits_metadata,
+     has_deep_gemm,
++    is_deep_gemm_supported,
+     native_next_n_supported,
+ )
+ from vllm.utils.platform_utils import num_compute_units
+@@ -656,7 +657,7 @@
+     return (
+         current_platform.is_cuda()
+         and current_platform.is_device_capability_family(100)
+-        and has_deep_gemm()
++        and is_deep_gemm_supported()
+     )
+ 
+ 
+@@ -664,7 +665,7 @@
+     return (
+         current_platform.is_cuda()
+         and current_platform.is_device_capability_family(90)
+-        and has_deep_gemm()
++        and is_deep_gemm_supported()
+     )
+ 
+ 
+@@ -673,7 +674,7 @@
+     instead of flattening to one single-token row per query, which re-reads
+     the KV tile once per row.
+     """
+-    if not (current_platform.is_cuda() and has_deep_gemm()):
++    if not (current_platform.is_cuda() and is_deep_gemm_supported()):
+         return next_n in (1, 2)
+     if current_platform.is_device_capability_family(100):
+         return True
+@@ -1264,7 +1265,7 @@
+ 
+             # DeepGEMM is required for the paged MQA logits on CUDA devices
+             schedule_metadata = self.scheduler_metadata_buffer
+-            if current_platform.is_cuda() and has_deep_gemm():
++            if current_platform.is_cuda() and is_deep_gemm_supported():
+                 metadata = get_paged_mqa_logits_metadata(
+                     seq_lens,
+                     self.kv_cache_spec.num_states,
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/attention/backends/registry.py vllm/v1/attention/backends/registry.py
+--- image-official/v1/attention/backends/registry.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/v1/attention/backends/registry.py	2026-09-10 16:12:53.006348563 -0700
+@@ -108,6 +108,15 @@
+         "vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse."
+         "DeepseekV4FlashInferMLASparseBackend"
+     )
++    # SM8x (Ampere) Triton sparse MLA for DeepSeek V4.1 (overlay).
++    TRITON_MLA_SPARSE_DSV41 = (
++        "vllm.models.deepseek_v4_1.ampere.ampere_sparse."
++        "DeepseekV41AmpereMLASparseBackend"
++    )
++    TRITON_SPARSE_SWA_DSV41 = (
++        "vllm.models.deepseek_v4_1.ampere.ampere_sparse."
++        "DeepseekV41AmpereSparseSWABackend"
++    )
+     B12X = "vllm.v1.attention.backends.b12x.B12xPagedAttentionBackend"
+     FLASH_ATTN_MLA = "vllm.v1.attention.backends.mla.flashattn_mla.FlashAttnMLABackend"
+     FLASH_ATTN_MLA_SPARSE = (
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/attention/ops/fp8_sm80.py vllm/v1/attention/ops/fp8_sm80.py
+--- image-official/v1/attention/ops/fp8_sm80.py	1969-12-31 16:00:00.000000000 -0800
++++ vllm/v1/attention/ops/fp8_sm80.py	2026-09-10 15:51:03.850778143 -0700
+@@ -0,0 +1,173 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""fp8 e4m3fn encode/decode for Triton kernels on pre-SM89 CUDA.
++
++Triton refuses every conversion between ``fp8e4nv`` and other float types
++below SM89 (``bitcast`` is allowed), so these substitute:
++
++- store side: a manual round-to-nearest-even saturating encoder on the fp32
++  bit pattern, bit-exact with ``x.to(tl.float8e4nv)`` /
++  ``torch.Tensor.to(torch.float8_e4m3fn)`` (satfinite semantics).
++- load side: a 256-entry bf16 lookup table. Measured 1.35-1.48x faster than
++  an ALU unpack in the sparse-MLA decode kernels -- the table stays in L1
++  while the ALU version's live values spill (68 spills vs 6), so prefer it
++  wherever a kernel can accept the extra pointer argument.
++
++``USE_FNUZ`` branches stay on the hardware convert: FNUZ only occurs on
++gfx942, which has it.
++"""
++
++import torch
++
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++
++
++def native_fp8_cast_supported() -> bool:
++    """Whether Triton may emit native fp8e4nv converts on this device.
++
++    Only CUDA below SM89 lacks the convert; other Triton backends
++    (XPU/ROCm) keep their native paths.
++    """
++    if not current_platform.is_cuda():
++        return True
++    return current_platform.supports_fp8()
++
++
++# Frozen into Triton kernels at first compile (globals referenced inside
++# @triton.jit are compile-time constants), so SM89+ keeps the hardware
++# convert and SM80 transparently gets the software path with no launcher
++# plumbing. Defaults to the software path: it is bit-exact everywhere, just
++# slower, so a failed probe degrades performance rather than compilation.
++try:
++    _NATIVE_FP8_CAST = tl.constexpr(native_fp8_cast_supported())
++except Exception:
++    _NATIVE_FP8_CAST = tl.constexpr(False)
++
++
++_E4M3FN_BF16_LUT_CACHE: dict[tuple[torch.device, float | None], torch.Tensor] = {}
++
++
++def get_e4m3fn_bf16_lut(
++    device: torch.device, nan_value: float | None = None
++) -> torch.Tensor:
++    """256-entry e4m3fn -> bf16 decode table.
++
++    ``nan_value`` replaces the two NaN encodings (0x7F/0xFF, signed): pass
++    a finite magnitude where NaN would poison a downstream reduction (the
++    indexer's dot product uses +-480), or leave it None for kernels that
++    scrub NaN themselves and need NaN in, NaN out.
++    """
++    key = (device, nan_value)
++    lut = _E4M3FN_BF16_LUT_CACHE.get(key)
++    if lut is None:
++        lut = (
++            torch.arange(256, dtype=torch.uint8, device=device)
++            .view(torch.float8_e4m3fn)
++            .to(torch.bfloat16)
++        )
++        if nan_value is not None:
++            lut[0x7F] = nan_value
++            lut[0xFF] = -nan_value
++        _E4M3FN_BF16_LUT_CACHE[key] = lut
++    return lut
++
++
++@triton.jit
++def _f32_to_e4m3fn_u8(x):
++    """fp32 -> e4m3fn byte: RNE, saturating to +-448, NaN -> 0x7F | sign.
++
++    Unified integer rounding: the f32 mantissa (implicit bit materialized)
++    is shifted so the kept bits land at the e4m3 granularity; the same
++    add-carry then handles mantissa-overflow into the exponent and
++    subnormal -> min-normal promotion.
++    """
++    fbits = x.to(tl.float32).to(tl.uint32, bitcast=True)
++    sign8 = ((fbits >> 24) & 0x80).to(tl.uint8)
++    mag = fbits & 0x7FFFFFFF
++
++    is_nan = mag > 0x7F800000
++
++    exp = (mag >> 23).to(tl.int32) - 127
++    mant = (mag & 0x7FFFFF) | 0x800000
++
++    # Normal e4m3 target keeps 3 mantissa bits -> drop 20; subnormal
++    # targets (exp < -6) drop progressively more. The cap keeps the shift in
++    # range for f32 subnormals and zero, which give exp <= -126; every value
++    # reaching it has rest < half, so it still rounds to zero.
++    shift = tl.minimum(20 + tl.maximum(-6 - exp, 0), 30)
++    keep = (mant >> shift).to(tl.uint32)
++    rest = mant & ((1 << shift) - 1)
++    half = (1 << (shift - 1)).to(tl.uint32)
++    round_up = (rest > half) | ((rest == half) & ((keep & 1) == 1))
++    keep = keep + round_up.to(tl.uint32)
++
++    # keep carries the implicit bit for normals: val = ((E-1)<<3) + keep.
++    val_normal = (((exp + 6) << 3).to(tl.uint32) + keep).to(tl.uint32)
++    val = tl.where(exp >= -6, val_normal, keep)
++    # satfinite: every overflow (incl. inf and mantissa-carry past 448)
++    # lands above 0x7E and clamps to the max finite.
++    val = tl.minimum(val, 0x7E)
++    val = tl.where(is_nan, 0x7F, val)
++    return (val.to(tl.uint8) | sign8).to(tl.uint8)
++
++
++@triton.jit
++def _encode_e4m3fn_u8(x):
++    """Drop-in for ``x.to(tl.float8e4nv).to(tl.uint8, bitcast=True)``."""
++    if _NATIVE_FP8_CAST:
++        return x.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
++    else:
++        return _f32_to_e4m3fn_u8(x)
++
++
++@triton.jit
++def _encode_fp8_u8(x, USE_FNUZ: tl.constexpr):
++    """FNUZ-aware byte encode: e4m3fnuz on gfx942, e4m3fn elsewhere."""
++    if USE_FNUZ:
++        return x.to(tl.float8e4b8).to(tl.uint8, bitcast=True)
++    else:
++        return _encode_e4m3fn_u8(x)
++
++
++@triton.jit
++def _e4m3fn_to_f32_alu(u):
++    """e4m3fn byte -> exact f32 via integer math, NaN preserved.
++
++    For kernels that cannot take a LUT pointer; prefer ``_decode_fp8_lut``.
++    """
++    u32 = u.to(tl.uint32)
++    sign = tl.where((u32 & 0x80) != 0, -1.0, 1.0)
++    exp = ((u32 >> 3) & 0xF).to(tl.float32)
++    mant = (u32 & 0x7).to(tl.float32)
++    is_normal = exp > 0.0
++    m = tl.where(is_normal, mant + 8.0, mant)
++    e = tl.where(is_normal, exp, 1.0) - 10.0
++    val = sign * m * tl.exp2(e)
++    return tl.where((u32 & 0x7F) == 0x7F, float("nan"), val)
++
++
++@triton.jit
++def _decode_fp8_f32(u, USE_FNUZ: tl.constexpr):
++    """FNUZ-aware byte decode to f32, without a LUT."""
++    if USE_FNUZ:
++        return u.to(tl.float8e4b8, bitcast=True).to(tl.float32)
++    elif _NATIVE_FP8_CAST:
++        return u.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    else:
++        return _e4m3fn_to_f32_alu(u)
++
++
++@triton.jit
++def _decode_fp8_lut(u, USE_FNUZ: tl.constexpr, lut_ptr):
++    """FNUZ-aware byte decode; pre-SM89 CUDA reads ``lut_ptr``.
++
++    ``lut_ptr`` must come from :func:`get_e4m3fn_bf16_nan_lut` and is
++    ignored (compile-time) wherever the hardware convert exists.
++    """
++    if USE_FNUZ:
++        return u.to(tl.float8e4b8, bitcast=True).to(tl.float32)
++    elif _NATIVE_FP8_CAST:
++        return u.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    else:
++        return tl.load(lut_ptr + u.to(tl.uint32))
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/attention/ops/mqa_logits_triton.py vllm/v1/attention/ops/mqa_logits_triton.py
+--- image-official/v1/attention/ops/mqa_logits_triton.py	1969-12-31 16:00:00.000000000 -0800
++++ vllm/v1/attention/ops/mqa_logits_triton.py	2026-09-11 00:25:06.282465948 -0700
+@@ -0,0 +1,485 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Triton fallback for DeepGEMM's fp8_mqa_logits / fp8_paged_mqa_logits."""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.ops.fp8_sm80 import get_e4m3fn_bf16_lut
++
++# Paged decode: num_warps=4 dominated on A100/SM80 across {2,4,8}; the others
++# were 1.5–1.7× slower at (num_heads=32, head_dim=128, block_size=64), so
++# narrow the sweep to keep autotune from latching onto a bad pick under noise.
++_PAGED_AUTOTUNE_CONFIGS = [
++    triton.Config({}, num_warps=4, num_stages=ns) for ns in (2, 4)
++]
++
++# Prefill: BLOCK_N=128 with num_warps=4 measured fastest at every shape
++# swept (M 1..2048, N 2048..131072) -- BN=64 is 1.25-1.40x worse, BN=32 up to
++# 2.41x. The autotune key is (num_heads, head_dim), both fixed for a model,
++# so a wider sweep cannot adapt per request; it only adds cold-cache JIT.
++_PREFILL_AUTOTUNE_CONFIGS = [
++    triton.Config({"BLOCK_N": 128}, num_warps=4, num_stages=ns) for ns in (2, 4)
++]
++
++# Warmup shape mirrors the chunked-prefill regime (small M, long N) so
++# autotune picks a tile sized for real serving rather than a launch-overhead-
++# dominated dummy grid.
++_PREFILL_WARMUP_M = 8
++_PREFILL_WARMUP_N = 8192
++
++
++# NaN bytes pin to +-480 so a NaN cache entry cannot poison the whole
++# logits row through the dot product.
++_INDEXER_LUT_NAN_VALUE = 480.0
++
++
++# dsv41: capture-safe autotune. Under FULL cudagraph mode the whole decode
++# attention (this indexer kernel included) is captured; a Triton autotune key
++# that was not primed by the warmups would benchmark (device sync) inside the
++# capture and abort it (cudaErrorStreamCaptureUnsupported). When that happens,
++# take the configs in declared order instead of benchmarking and say so, so the
++# missing warmup can be added. The paged/prefill sweeps here only differ in
++# num_stages, so the first config is a sound choice.
++import triton.runtime.autotuner as _tt_autotuner
++from vllm.logger import init_logger as _dsv41_init_logger
++
++_dsv41_logger = _dsv41_init_logger(__name__)
++_dsv41_orig_bench = _tt_autotuner.Autotuner._bench
++
++
++def _dsv41_capture_safe_bench(self, *args, config, **kwargs):
++    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
++        rank = self.configs.index(config) if config in self.configs else 0
++        if rank == 0:
++            _dsv41_logger.warning(
++                "Triton autotune for %s requested during CUDA graph capture; "
++                "using the first config without benchmarking (add a warmup for "
++                "this key)", getattr(self.base_fn, "__name__", "?"),
++            )
++        return [float(rank), float(rank), float(rank)]
++    return _dsv41_orig_bench(self, *args, config=config, **kwargs)
++
++
++if not getattr(_tt_autotuner.Autotuner, "_dsv41_capture_safe", False):
++    _tt_autotuner.Autotuner._bench = _dsv41_capture_safe_bench
++    _tt_autotuner.Autotuner._dsv41_capture_safe = True
++
++
++def _get_e4m3fn_bf16_lut(device: torch.device) -> torch.Tensor:
++    return get_e4m3fn_bf16_lut(device, nan_value=_INDEXER_LUT_NAN_VALUE)
++
++
++@triton.jit
++def _decode_e4m3fn_bf16_lut(u, lut_ptr):
++    return tl.load(lut_ptr + u.to(tl.uint32))
++
++
++@triton.autotune(
++    configs=_PAGED_AUTOTUNE_CONFIGS,
++    key=["num_heads", "head_dim", "block_size"],
++)
++@triton.jit
++def _fp8_paged_mqa_logits_kernel(
++    q_ptr,
++    kv_fp8_ptr,
++    kv_scale_ptr,
++    weights_ptr,
++    fp8_lut_ptr,
++    context_lens_ptr,
++    block_tables_ptr,
++    logits_ptr,
++    stride_q_b,
++    stride_q_n,
++    stride_q_h,
++    stride_q_d,
++    stride_kvf_block,
++    stride_kvf_s,
++    stride_kvf_d,
++    stride_kvs_block,
++    stride_kvs_s,
++    stride_w_t,
++    stride_w_h,
++    stride_bt_b,
++    stride_bt_k,
++    stride_l_t,
++    stride_l_n,
++    next_n: tl.constexpr,
++    num_heads: tl.constexpr,
++    head_dim: tl.constexpr,
++    block_size: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    token_id = tl.program_id(0)
++    block_rk = tl.program_id(1)
++
++    batch_id = token_id // next_n
++    next_n_id = token_id % next_n
++
++    context_len = tl.load(context_lens_ptr + batch_id)
++    if block_rk * block_size >= context_len:
++        return
++
++    q_offset = context_len - next_n + next_n_id
++
++    # int64: unified-KV-pool layer views carry a large block stride (~1e6
++    # elements), so int32 `block_idx * stride` wraps once a batch touches
++    # roughly >2k pool blocks (long context or concurrent sequences).
++    block_idx = tl.load(
++        block_tables_ptr + batch_id * stride_bt_b + block_rk * stride_bt_k
++    ).to(tl.int64)
++
++    offs_h = tl.arange(0, BLOCK_H)
++    offs_d = tl.arange(0, BLOCK_D)
++    offs_n = tl.arange(0, BLOCK_N)
++    mask_h = offs_h < num_heads
++    mask_d = offs_d < head_dim
++    mask_n = offs_n < block_size
++
++    q_base = q_ptr + batch_id * stride_q_b + next_n_id * stride_q_n
++    q_byte = tl.load(
++        q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d,
++        mask=mask_h[:, None] & mask_d[None, :],
++        other=0,
++    )
++    q = _decode_e4m3fn_bf16_lut(q_byte, fp8_lut_ptr)
++
++    kvf_base = kv_fp8_ptr + block_idx * stride_kvf_block
++    k_byte = tl.load(
++        kvf_base + offs_n[:, None] * stride_kvf_s + offs_d[None, :] * stride_kvf_d,
++        mask=mask_n[:, None] & mask_d[None, :],
++        other=0,
++    )
++    kvs_base = kv_scale_ptr + block_idx * stride_kvs_block
++    k_scale = tl.load(
++        kvs_base + offs_n * stride_kvs_s,
++        mask=mask_n,
++        other=0.0,
++    )
++    k = _decode_e4m3fn_bf16_lut(k_byte, fp8_lut_ptr)
++    # Scale in fp32 after the dot to avoid an extra bf16 round-trip on K.
++    s = tl.dot(q, tl.trans(k)) * k_scale[None, :]
++
++    w = tl.load(
++        weights_ptr + token_id * stride_w_t + offs_h * stride_w_h,
++        mask=mask_h,
++        other=0.0,
++    )
++    s = tl.where(s > 0, s, 0.0) * w[:, None]
++    out = tl.sum(s, axis=0)
++
++    k_offset = block_rk * block_size + offs_n
++    # Store mask below covers mask_n and the context bound; -inf only has to
++    # mask the causal tail inside the written region.
++    out = tl.where(k_offset <= q_offset, out, float("-inf"))
++
++    tl.store(
++        logits_ptr + token_id * stride_l_t + k_offset * stride_l_n,
++        out,
++        mask=mask_n & (k_offset < context_len),
++    )
++
++
++def fp8_paged_mqa_logits_triton(
++    q: torch.Tensor,
++    kv_cache: torch.Tensor,
++    weights: torch.Tensor,
++    context_lens: torch.Tensor,
++    block_tables: torch.Tensor,
++    max_model_len: int,
++    clean_logits: bool = True,
++) -> torch.Tensor:
++    """Triton implementation of DeepGEMM's fp8_paged_mqa_logits.
++
++    Args:
++        q:             [B, next_n, H, D] fp8_e4m3fn
++        kv_cache:      [num_blocks, block_size, 1, D+4] uint8 (FP8 + fp32 scale)
++        weights:       [B*next_n, H] float32
++        context_lens:  [B] int32
++        block_tables:  [B, max_blocks] int32
++        max_model_len: output width. Caller passes the active batch max so
++            the logits buffer and grid stay tight.
++        clean_logits: when False, skip the -inf pre-fill of the output
++            (indexer top-k reads only `[:context_len]` per row).
++    Returns:
++        logits:        [B*next_n, max_model_len] float32
++    """
++    B, next_n, num_heads, head_dim = q.shape
++    _, block_size, one, d_plus_4 = kv_cache.shape
++    assert one == 1
++    assert d_plus_4 == head_dim + 4
++
++    # Cache layout from `indexer_k_quant_and_cache`: per block, FP8 K bytes
++    # (block_size * head_dim) followed by fp32 scales (block_size * 4). The
++    # `[NB, block_size, 1, head_dim+4]` shape is a stride trick; re-slice flat.
++    # Kernel decodes FP8 from uint8 via LUT (SM80 Triton can't load fp8e4nv).
++    num_blocks = kv_cache.shape[0]
++    kv_flat = kv_cache.view(num_blocks, -1)
++    k_end = block_size * head_dim
++    kv_byte = kv_flat[:, :k_end].as_strided(
++        (num_blocks, block_size, head_dim),
++        (kv_flat.stride(0), head_dim, 1),
++    )
++    kv_scale = kv_flat[:, k_end:].view(torch.float32)
++    q_byte = q.view(torch.uint8)
++
++    if clean_logits:
++        logits = torch.full(
++            (B * next_n, max_model_len),
++            float("-inf"),
++            dtype=torch.float32,
++            device=q.device,
++        )
++    else:
++        logits = torch.empty(
++            (B * next_n, max_model_len), dtype=torch.float32, device=q.device
++        )
++
++    BLOCK_H = max(16, triton.next_power_of_2(num_heads))
++    BLOCK_D = triton.next_power_of_2(head_dim)
++    BLOCK_N = triton.next_power_of_2(block_size)
++
++    fp8_lut = _get_e4m3fn_bf16_lut(q.device)
++    # The block table is allocated at full max_model_len width and only
++    # narrowed along dim 0, so sizing the grid by it launches a CTA per
++    # possible block rather than per live one; each surplus CTA loads
++    # context_lens and returns. max_model_len here is the active batch max.
++    num_block_cols = min(block_tables.shape[1], triton.cdiv(max_model_len, block_size))
++    grid = (B * next_n, num_block_cols)
++    _fp8_paged_mqa_logits_kernel[grid](
++        q_byte,
++        kv_byte,
++        kv_scale,
++        weights,
++        fp8_lut,
++        context_lens,
++        block_tables,
++        logits,
++        q_byte.stride(0),
++        q_byte.stride(1),
++        q_byte.stride(2),
++        q_byte.stride(3),
++        kv_byte.stride(0),
++        kv_byte.stride(1),
++        kv_byte.stride(2),
++        kv_scale.stride(0),
++        kv_scale.stride(1),
++        weights.stride(0),
++        weights.stride(1),
++        block_tables.stride(0),
++        block_tables.stride(1),
++        logits.stride(0),
++        logits.stride(1),
++        next_n=next_n,
++        num_heads=num_heads,
++        head_dim=head_dim,
++        block_size=block_size,
++        BLOCK_H=BLOCK_H,
++        BLOCK_D=BLOCK_D,
++        BLOCK_N=BLOCK_N,
++    )
++    return logits
++
++
++@triton.autotune(
++    configs=_PREFILL_AUTOTUNE_CONFIGS,
++    # Per-program work is N-independent; key on (heads, dim) only so chunked
++    # prefill with varying N doesn't re-tune on every new chunk size.
++    key=["num_heads", "head_dim"],
++)
++@triton.jit
++def _fp8_mqa_logits_kernel(
++    q_ptr,
++    k_ptr,
++    k_scale_ptr,
++    weights_ptr,
++    ks_ptr,
++    ke_ptr,
++    logits_ptr,
++    stride_q_m,
++    stride_q_h,
++    stride_q_d,
++    stride_k_n,
++    stride_k_d,
++    stride_w_m,
++    stride_w_h,
++    stride_l_m,
++    stride_l_n,
++    num_heads: tl.constexpr,
++    head_dim: tl.constexpr,
++    N,
++    BLOCK_H: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    # bf16 q/k inputs: the wrapper pre-decodes FP8 → bf16. At compute-bound
++    # prefill this is ~2× the in-kernel LUT (LUT lookups contend with the
++    # matmul for ALU/regs). Paged-decode keeps the LUT path.
++    m = tl.program_id(0)
++    n_block = tl.program_id(1)
++
++    n_start = n_block * BLOCK_N
++    offs_n = n_start + tl.arange(0, BLOCK_N)
++    mask_n = offs_n < N
++    # Early-exit when this row's `[ks, ke)` range doesn't overlap the tile.
++    # Chunked prefill produces many such all-masked tiles per row.
++    ks = tl.load(ks_ptr + m)
++    ke = tl.load(ke_ptr + m)
++    if (n_start >= ke) | (n_start + BLOCK_N <= ks):
++        # When `clean_logits=False` the caller skipped the -inf pre-fill, so
++        # write -inf here for the early-exit tile.
++        tl.store(
++            logits_ptr + m * stride_l_m + offs_n * stride_l_n,
++            tl.full([BLOCK_N], float("-inf"), dtype=tl.float32),
++            mask=mask_n,
++        )
++        return
++
++    offs_h = tl.arange(0, BLOCK_H)
++    offs_d = tl.arange(0, BLOCK_D)
++    mask_h = offs_h < num_heads
++    mask_d = offs_d < head_dim
++
++    q = tl.load(
++        q_ptr
++        + m * stride_q_m
++        + offs_h[:, None] * stride_q_h
++        + offs_d[None, :] * stride_q_d,
++        mask=mask_h[:, None] & mask_d[None, :],
++        other=0.0,
++    )
++
++    k = tl.load(
++        k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :] * stride_k_d,
++        mask=mask_n[:, None] & mask_d[None, :],
++        other=0.0,
++    )
++    k_scale = tl.load(k_scale_ptr + offs_n, mask=mask_n, other=0.0)
++    s = tl.dot(q, tl.trans(k)) * k_scale[None, :]
++
++    w = tl.load(
++        weights_ptr + m * stride_w_m + offs_h * stride_w_h,
++        mask=mask_h,
++        other=0.0,
++    )
++    s = tl.where(s > 0, s, 0.0) * w[:, None]
++    out = tl.sum(s, axis=0)
++
++    # Store mask below covers mask_n; -inf masks the [ks, ke) range only.
++    out = tl.where((offs_n >= ks) & (offs_n < ke), out, float("-inf"))
++
++    tl.store(
++        logits_ptr + m * stride_l_m + offs_n * stride_l_n,
++        out,
++        mask=mask_n,
++    )
++
++
++def fp8_mqa_logits_triton(
++    q: torch.Tensor,
++    kv: tuple[torch.Tensor, torch.Tensor],
++    weights: torch.Tensor,
++    cu_seqlen_ks: torch.Tensor,
++    cu_seqlen_ke: torch.Tensor,
++    clean_logits: bool = True,
++) -> torch.Tensor:
++    """Triton implementation of DeepGEMM's fp8_mqa_logits.
++
++    Args:
++        q:            [M, H, D] fp8_e4m3fn
++        kv:           (k_fp8 [N, D], k_scales [N]) — fp8_e4m3fn, float32
++        weights:      [M, H] float32
++        cu_seqlen_ks: [M] int32
++        cu_seqlen_ke: [M] int32
++        clean_logits: when False, skip the -inf pre-fill of the output
++            (indexer top-k reads only `[ks, ke)` per row). Matches DeepGEMM.
++    Returns:
++        logits:       [M, N] float32
++    """
++    k_fp8, k_scales = kv
++    k_scales = k_scales.reshape(-1)
++
++    M, num_heads, head_dim = q.shape
++    N = k_fp8.shape[0]
++
++    # The grid covers every (m, n_block) and each tile stores its full row
++    # span, so a -inf pre-fill would be entirely overwritten; `clean_logits`
++    # is accepted for DeepGEMM signature parity only.
++    logits = torch.empty((M, N), dtype=torch.float32, device=q.device)
++
++    BLOCK_H = max(16, triton.next_power_of_2(num_heads))
++    BLOCK_D = triton.next_power_of_2(head_dim)
++
++    # Pre-decode FP8 → bf16; the kernel runs a straight `tl.dot`.
++    q_bf16 = q.to(torch.bfloat16)
++    k_bf16 = k_fp8.to(torch.bfloat16)
++
++    # Grid depends on the autotuned BLOCK_N.
++    grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa: E731
++    _fp8_mqa_logits_kernel[grid](
++        q_bf16,
++        k_bf16,
++        k_scales,
++        weights,
++        cu_seqlen_ks,
++        cu_seqlen_ke,
++        logits,
++        q_bf16.stride(0),
++        q_bf16.stride(1),
++        q_bf16.stride(2),
++        k_bf16.stride(0),
++        k_bf16.stride(1),
++        weights.stride(0),
++        weights.stride(1),
++        logits.stride(0),
++        logits.stride(1),
++        num_heads=num_heads,
++        head_dim=head_dim,
++        N=N,
++        BLOCK_H=BLOCK_H,
++        BLOCK_D=BLOCK_D,
++    )
++    return logits
++
++
++def warmup_fp8_mqa_logits_triton(
++    num_heads: int,
++    head_dim: int,
++    device: torch.device,
++) -> None:
++    """Prime the prefill `@triton.autotune` cache so first-call doesn't pay
++    the inline sweep (~5–8 s on A100 SM80). N is a runtime scalar, so one
++    small-M / long-N shape covers all chunk lengths."""
++    m = _PREFILL_WARMUP_M
++    n = _PREFILL_WARMUP_N
++    q = torch.empty(m, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device)
++    k = torch.empty(n, head_dim, dtype=torch.float8_e4m3fn, device=device)
++    scales = torch.zeros(n, dtype=torch.float32, device=device)
++    weights = torch.zeros(m, num_heads, dtype=torch.float32, device=device)
++    ks = torch.zeros(m, dtype=torch.int32, device=device)
++    ke = torch.full((m,), n, dtype=torch.int32, device=device)
++    fp8_mqa_logits_triton(q, (k, scales), weights, ks, ke)
++
++
++def warmup_fp8_paged_mqa_logits_triton(
++    num_heads: int,
++    head_dim: int,
++    block_size: int,
++    device: torch.device,
++) -> None:
++    """Prime the paged-decode `@triton.autotune` cache for the indexer's
++    logits kernel (see `warmup_fp8_mqa_logits_triton` for rationale).
++    """
++    num_blocks = 2
++    q = torch.empty(1, 1, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device)
++    kv_cache = torch.zeros(
++        num_blocks, block_size, 1, head_dim + 4, dtype=torch.uint8, device=device
++    )
++    weights = torch.zeros(1, num_heads, dtype=torch.float32, device=device)
++    context_lens = torch.tensor([block_size], dtype=torch.int32, device=device)
++    block_tables = torch.zeros(1, 1, dtype=torch.int32, device=device)
++    fp8_paged_mqa_logits_triton(
++        q, kv_cache, weights, context_lens, block_tables, max_model_len=block_size
++    )
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/attention/ops/rocm_aiter_mla_sparse.py vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+--- image-official/v1/attention/ops/rocm_aiter_mla_sparse.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/v1/attention/ops/rocm_aiter_mla_sparse.py	2026-09-10 16:12:53.048870424 -0700
+@@ -18,6 +18,11 @@
+ from vllm.utils.torch_utils import LayerNameType
+ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
++from vllm.v1.attention.ops.fp8_sm80 import (
++    _decode_fp8_f32,
++    _decode_fp8_lut,
++    get_e4m3fn_bf16_lut,
++)
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ if current_platform.is_rocm():
+@@ -1618,10 +1623,7 @@
+     scales = _decode_e8m0_scales_triton(encoded_scales)
+     scales = tl.broadcast_to(scales[:, :, None], (BLOCK_K, CHUNK_SIZE // 64, 64))
+     scales = tl.reshape(scales, (BLOCK_K, CHUNK_SIZE))
+-    if IS_FNUZ:
+-        x_f32 = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.bfloat16).to(tl.float32)
+-    else:
+-        x_f32 = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ)
+     value = (x_f32 * scales).to(tl.bfloat16)
+     zero = tl.zeros((BLOCK_K, CHUNK_SIZE), dtype=tl.bfloat16)
+     return tl.where(valid[:, None], value, zero)
+@@ -1653,10 +1655,7 @@
+     scales = _decode_e8m0_scales_triton(encoded_scales)
+     scales = tl.broadcast_to(scales[:, :, None], (BLOCK_K, 2, 64))
+     scales = tl.reshape(scales, (BLOCK_K, 128))
+-    if IS_FNUZ:
+-        x_f32 = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.bfloat16).to(tl.float32)
+-    else:
+-        x_f32 = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ)
+     nope = (x_f32 * scales).to(tl.bfloat16)
+ 
+     rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+@@ -1680,6 +1679,7 @@
+     extra_indices_ptr,
+     extra_indptr_ptr,
+     attn_sink_ptr,
++    fp8_lut_ptr,
+     out_ptr,
+     q_stride0,
+     q_stride1,
+@@ -1758,17 +1758,14 @@
+             mask=valid[:, None] & nope_mask[None, :],
+             other=0,
+         )
+-        if IS_FNUZ_MAIN:
+-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-        else:
+-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
++        k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_MAIN, fp8_lut_ptr)
+         encoded_scales = tl.load(
+             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+             mask=valid[:, None] & nope_mask[None, :],
+             other=127,
+         )
+         scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
++        k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+ 
+@@ -1826,17 +1823,14 @@
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=0,
+             )
+-            if IS_FNUZ_EXTRA:
+-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-            else:
+-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
++            k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_EXTRA, fp8_lut_ptr)
+             encoded_scales = tl.load(
+                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=127,
+             )
+             scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
++            k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+ 
+@@ -1918,6 +1912,7 @@
+     part_m_ptr,
+     part_l_ptr,
+     part_acc_ptr,
++    fp8_lut_ptr,
+     q_stride0,
+     q_stride1,
+     main_cache_stride0,
+@@ -2008,17 +2003,14 @@
+             mask=valid[:, None] & nope_mask[None, :],
+             other=0,
+         )
+-        if IS_FNUZ_MAIN:
+-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-        else:
+-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
++        k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_MAIN, fp8_lut_ptr)
+         encoded_scales = tl.load(
+             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+             mask=valid[:, None] & nope_mask[None, :],
+             other=127,
+         )
+         scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
++        k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+ 
+@@ -2079,17 +2071,14 @@
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=0,
+             )
+-            if IS_FNUZ_EXTRA:
+-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-            else:
+-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
++            k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_EXTRA, fp8_lut_ptr)
+             encoded_scales = tl.load(
+                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=127,
+             )
+             scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
++            k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+ 
+@@ -2916,6 +2905,7 @@
+     extra_cache_nan_free: bool = False,
+     adaptive_splits: bool = False,
+ ) -> torch.Tensor:
++    fp8_lut = get_e4m3fn_bf16_lut(q.device)
+     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
+     assert main_cache.ndim == 3, (
+         f"expected main_cache=[blocks,block,bytes], got {main_cache.shape}"
+@@ -3006,6 +2996,7 @@
+             extra_indices,
+             extra_indptr,
+             attn_sink,
++            fp8_lut,
+             out,
+             q.stride(0),
+             q.stride(1),
+@@ -3125,6 +3116,7 @@
+             part_m,
+             part_l,
+             part_acc,
++            fp8_lut,
+             q.stride(0),
+             q.stride(1),
+             main_cache.stride(0),
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/core/kv_cache_utils.py vllm/v1/core/kv_cache_utils.py
+--- image-official/v1/core/kv_cache_utils.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/v1/core/kv_cache_utils.py	2026-09-10 20:37:53.603616175 -0700
+@@ -1725,8 +1725,12 @@
+         group_spec = group.kv_cache_spec
+         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+         if isinstance(group_spec, UniformTypeKVCacheSpecs):
++            # dsv41: only this worker's layers (a projected group may be empty
++            # here while its spec dict still lists the other ranks' layers).
++            local_names = set(group.layer_names)
+             for layer_name, spec in group_spec.kv_cache_specs.items():
+-                layers_by_spec[spec].append(layer_name)
++                if layer_name in local_names:
++                    layers_by_spec[spec].append(layer_name)
+         elif group.layer_names:
+             layers_by_spec[group_spec].extend(group.layer_names)
+ 
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/core/sched/scheduler.py vllm/v1/core/sched/scheduler.py
+--- image-official/v1/core/sched/scheduler.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/v1/core/sched/scheduler.py	2026-09-11 08:44:06.448574221 -0700
+@@ -590,6 +590,17 @@
+                 req_index += 1
+                 continue
+ 
++            # dsv41: under PP (non-async) the engine schedules ahead while the
++            # previous step is in flight; only drafts would be schedulable for a
++            # request whose real tokens are all computed -> wait for its output.
++            if (
++                self.use_pp
++                and not self.scheduler_config.async_scheduling
++                and request.num_tokens + request.num_output_placeholders
++                <= request.num_computed_tokens
++            ):
++                req_index += 1
++                continue
+             num_new_tokens = (
+                 request.num_tokens_with_spec
+                 + request.num_output_placeholders
+@@ -1579,9 +1590,12 @@
+                 num_tokens = num_scheduled_tokens[req_id] - len(
+                     spec_decode_tokens.get(req_id, ())
+                 )
+-                token_ids = req.all_token_ids[
+-                    req.num_computed_tokens : req.num_computed_tokens + num_tokens
+-                ]
++                # dsv41: send every token the workers have not seen yet (accepted
++                # draft tokens included), not just the one scheduled this step.
++                end = req.num_computed_tokens + num_tokens
++                sent = max(self._dsv41_pp_sent.get(req_id, 0), req.num_prompt_tokens)
++                token_ids = req.all_token_ids[sent:end]
++                self._dsv41_pp_sent[req_id] = max(sent, end)
+                 new_token_ids.append(token_ids)
+             if idx >= num_running_reqs:
+                 resumed_req_ids.add(req_id)
+@@ -2486,9 +2500,17 @@
+ 
+         return valid_requests
+ 
++    @property
++    def _dsv41_pp_sent(self) -> dict[str, int]:
++        d = self.__dict__.get("_dsv41_pp_sent_dict")
++        if d is None:
++            d = self.__dict__["_dsv41_pp_sent_dict"] = {}
++        return d
++
+     def _free_request(
+         self, request: Request, delay_free_blocks: bool = False
+     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
++        self._dsv41_pp_sent.pop(request.request_id, None)
+         assert request.is_finished()
+ 
+         self._inflight_prefills.discard(request)
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/cudagraph_dispatcher.py vllm/v1/cudagraph_dispatcher.py
+--- image-official/v1/cudagraph_dispatcher.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/v1/cudagraph_dispatcher.py	2026-09-11 16:08:37.222998611 -0700
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Set as AbstractSet
++import os
+ from dataclasses import replace
+ from itertools import product
+ 
+@@ -135,12 +136,27 @@
+         uniform_decode: bool,
+         has_lora: bool,
+         num_active_loras: int = 0,
++        uniform_query_len: int | None = None,
+     ) -> BatchDescriptor:
+         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+-        uniform_decode_query_len = self.uniform_decode_query_len
++        # dsv41 q1: the caller may name the uniform query length (1 for draft-less steps)
++        uniform_decode_query_len = uniform_query_len or self.uniform_decode_query_len
+         num_tokens_padded = self._bs_to_padded_graph_size[num_tokens]
+ 
+         if uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
++            if num_tokens_padded % uniform_decode_query_len != 0:
++                # capture sizes are no longer rounded to multiples of (K+1): pick the
++                # next size that is, or give up on a uniform (FULL) dispatch
++                cands = [
++                    s
++                    for s in self.compilation_config.cudagraph_capture_sizes
++                    if s >= num_tokens and s % uniform_decode_query_len == 0
++                ]
++                if cands:
++                    num_tokens_padded = cands[0]
++                else:
++                    uniform_decode = False
++        if uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
+             num_reqs = min(num_tokens_padded // uniform_decode_query_len, max_num_seqs)
+             assert num_tokens_padded % uniform_decode_query_len == 0
+         else:
+@@ -219,6 +235,7 @@
+                 x
+                 for x in self.compilation_config.cudagraph_capture_sizes
+                 if x <= max_num_tokens and x >= uniform_decode_query_len
++                and x % uniform_decode_query_len == 0  # dsv41 q1: sizes are unrounded
+             ]
+             for bs, num_active_loras in product(
+                 cudagraph_capture_sizes_for_decode, lora_cases
+@@ -229,6 +246,27 @@
+                         bs, True, num_active_loras > 0, num_active_loras
+                     ),
+                 )
++            # dsv41 q1: a second family of FULL decode graphs with query length 1 for
++            # steps in which the drafter proposed nothing (num_tokens == num_reqs)
++            if uniform_decode_query_len > 1 and os.environ.get("DSV41_FULL_Q1", "1") == "1":
++                # dsv41 qall: one FULL family per uniform query length q < K+1
++                max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
++                for q in range(1, uniform_decode_query_len):
++                    for bs, num_active_loras in product(
++                        [
++                            x
++                            for x in self.compilation_config.cudagraph_capture_sizes
++                            if x % q == 0 and x // q <= max_num_seqs
++                        ],
++                        lora_cases,
++                    ):
++                        self.add_cudagraph_key(
++                            CUDAGraphMode.FULL,
++                            self._create_padded_batch_descriptor(
++                                bs, True, num_active_loras > 0, num_active_loras,
++                                uniform_query_len=q,
++                            ),
++                        )
+ 
+         self.keys_initialized = True
+ 
+@@ -240,6 +278,7 @@
+         num_active_loras: int = 0,
+         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
+         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
++        uniform_query_len: int | None = None,  # dsv41 q1
+     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
+         """
+         Given conditions(e.g.,batch descriptor and if using piecewise only),
+@@ -301,7 +340,8 @@
+ 
+         normalized_uniform = uniform_decode and self.cudagraph_mode.separate_routine()
+         batch_desc = self._create_padded_batch_descriptor(
+-            num_tokens, normalized_uniform, has_lora, effective_num_active_loras
++            num_tokens, normalized_uniform, has_lora, effective_num_active_loras,
++            uniform_query_len=uniform_query_len if normalized_uniform else None,
+         )
+ 
+         if CUDAGraphMode.FULL in allowed_modes:
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/engine/core.py vllm/v1/engine/core.py
+--- image-official/v1/engine/core.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/v1/engine/core.py	2026-09-11 22:48:53.773280033 -0700
+@@ -96,6 +96,24 @@
+ 
+ logger = init_logger(__name__)
+ 
++import os as _dsv41_os
++import time as _dsv41_time
++_DSV41_CORE = _dsv41_os.environ.get("DSV41_DEBUG_CORE") == "1"
++_DSV41_ACC: dict[str, float] = {}
++_DSV41_CNT: dict[str, int] = {}
++
++
++def _dsv41_acc(key: str, dt: float) -> None:
++    _DSV41_ACC[key] = _DSV41_ACC.get(key, 0.0) + dt
++    _DSV41_CNT[key] = _DSV41_CNT.get(key, 0) + 1
++
++
++def _dsv41_report(n_real: int) -> None:
++    if n_real % 32 == 0:
++        parts = [f"{k} {1e3 * v / max(1, _DSV41_CNT[k]):.2f}ms x{_DSV41_CNT[k]}" for k, v in sorted(_DSV41_ACC.items())]
++        logger.info("DSV41 CORE (per-call means since boot, %d real steps): %s", n_real, "; ".join(parts))
++
++
+ 
+ HANDSHAKE_TIMEOUT_MINS = 5
+ 
+@@ -641,8 +659,16 @@
+         # When using async scheduling we can't get draft token ids in advance,
+         # so we update draft token ids in the worker process and don't
+         # need to update draft token ids here.
+-        if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
++        if (
++            self.check_for_draft_tokens
++            and not self.async_scheduling
++            and model_executed
++            and getattr(self, "_dsv41_needs_draft", True)  # dsv41 prefill-chunk
++        ):
++            _dsv41_t = _dsv41_time.perf_counter() if _DSV41_CORE else 0.0
+             draft_token_ids = self.model_executor.take_draft_token_ids()
++            if _DSV41_CORE:
++                _dsv41_acc("take_draft", _dsv41_time.perf_counter() - _dsv41_t)
+             if draft_token_ids is not None:
+                 self.scheduler.update_draft_token_ids(draft_token_ids)
+ 
+@@ -674,11 +700,38 @@
+         model_executed = False
+         deferred_scheduler_output = None
+         if self.scheduler.has_requests():
++            _dsv41_t = _dsv41_time.perf_counter() if _DSV41_CORE else 0.0
+             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
++            if _DSV41_CORE:
++                _dsv41_t2 = _dsv41_time.perf_counter()
++                _dsv41_acc("schedule" if scheduler_output.total_num_scheduled_tokens else "schedule_empty", _dsv41_t2 - _dsv41_t)
++                _dsv41_t = _dsv41_t2
++            if _dsv41_os.environ.get("DSV41_DEBUG_TRACE") == "1" and scheduler_output.total_num_scheduled_tokens:
++                self._dsv41_tr_step = getattr(self, "_dsv41_tr_step", 0) + 1
++                if 40 <= self._dsv41_tr_step <= 44 or (
++                    scheduler_output.total_num_scheduled_tokens > 1
++                    and self._dsv41_tr_step <= 60
++                    and _dsv41_os.environ.get("DSV41_DEBUG_TRACE_PREFILL") == "1"
++                ):
++                    logger.info("DSV41 TRACE core step %d T=%d exec_issue=%.4f", self._dsv41_tr_step,
++                                scheduler_output.total_num_scheduled_tokens, _dsv41_time.perf_counter())
+             with self.log_error_detail(scheduler_output):
+                 exec_future = self.model_executor.execute_model(
+                     scheduler_output, non_block=True
+                 )
++            if _DSV41_CORE:
++                _dsv41_acc("exec_rpc" if scheduler_output.total_num_scheduled_tokens else "exec_rpc_empty", _dsv41_time.perf_counter() - _dsv41_t)
++            # dsv41 prefill-chunk: drafts only matter once a request has its whole prompt; for
++            # batches made of intermediate prefill chunks, skip the blocking draft RPC in
++            # post_step so the next chunk can be scheduled and the pipeline fills
++            if _dsv41_os.environ.get("DSV41_DRAFT_SKIP_PREFILL", "1") == "1":
++                needs = False
++                for _rid in scheduler_output.num_scheduled_tokens:
++                    _req = self.scheduler.requests.get(_rid)
++                    if _req is None or _req.num_computed_tokens >= _req.num_prompt_tokens:
++                        needs = True
++                        break
++                self._dsv41_needs_draft = needs
+             if self.is_ec_consumer:
+                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
+ 
+@@ -692,9 +745,12 @@
+                     grammar_output = self.scheduler.get_grammar_bitmask(
+                         scheduler_output
+                     )
++                    _dsv41_t = _dsv41_time.perf_counter() if _DSV41_CORE else 0.0
+                     future = self.model_executor.sample_tokens(
+                         grammar_output, non_block=True
+                     )
++                    if _DSV41_CORE:
++                        _dsv41_acc("sample_rpc", _dsv41_time.perf_counter() - _dsv41_t)
+                 else:
+                     # We need to defer sampling until we have processed the model output
+                     # from the prior step.
+@@ -718,6 +774,7 @@
+ 
+         # Block until the next result is available.
+         future, scheduler_output, exec_model_fut = batch_queue.pop()
++        _dsv41_t = _dsv41_time.perf_counter() if _DSV41_CORE else 0.0
+         with (
+             self.capture_iteration_details(scheduler_output) as iteration_details,
+             self.log_error_detail(scheduler_output),
+@@ -728,6 +785,10 @@
+                 # call failed - raise that exception.
+                 exec_model_fut.result()
+                 raise RuntimeError("unexpected error")
++        if _DSV41_CORE:
++            _dsv41_t2 = _dsv41_time.perf_counter()
++            _dsv41_acc("wait_result" if scheduler_output.total_num_scheduled_tokens else "wait_result_empty", _dsv41_t2 - _dsv41_t)
++            _dsv41_t = _dsv41_t2
+ 
+         # Before processing the model output, process any aborts that happened
+         # during the model execution.
+@@ -736,6 +797,10 @@
+             scheduler_output, model_output
+         )
+         self._attach_iteration_details(engine_core_outputs, iteration_details)
++        if _DSV41_CORE and scheduler_output.total_num_scheduled_tokens:
++            _dsv41_acc("update_from_output", _dsv41_time.perf_counter() - _dsv41_t)
++            self._dsv41_real = getattr(self, "_dsv41_real", 0) + 1
++            _dsv41_report(self._dsv41_real)
+ 
+         # NOTE(nick): We can either handle the deferred tasks here or save
+         # in a field and do it immediately once step_with_batch_queue is
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/worker/gpu_model_runner.py vllm/v1/worker/gpu_model_runner.py
+--- image-official/v1/worker/gpu_model_runner.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/v1/worker/gpu_model_runner.py	2026-09-11 16:08:37.223696983 -0700
+@@ -15,6 +15,7 @@
+ from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
+ 
+ import numpy as np
++import os
+ import torch
+ import torch.distributed
+ import torch.nn as nn
+@@ -159,6 +160,7 @@
+ from vllm.v1.core.sched.output import NewRequestData
+ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+ from vllm.v1.kv_cache_interface import (
++    CircularBufferSpec,
+     AttentionSpec,
+     ChunkedLocalAttentionSpec,
+     CrossAttentionSpec,
+@@ -630,6 +632,9 @@
+         # NOTE(Jiayi): currently we put the entire draft model on
+         # the last PP rank. This is not ideal if there are many
+         # layers in the draft model.
++        # dsv41: non-last PP ranks never build a drafter but the metadata builder
++        # isinstance-checks it; None makes those checks false instead of raising.
++        self.drafter = None  # type: ignore[assignment]
+         if self.speculative_config and get_pp_group().is_last_rank:
+             self.drafter: (
+                 NgramProposer  # noqa: F823
+@@ -678,6 +683,12 @@
+                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
+             elif self.speculative_config.use_step3p5_mtp():
+                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
++            elif self.speculative_config.use_dspark():
++                # dsv41 dspark: V1-runner port of the V2 DSpark speculator
++                from hybrid.dspark_proposer import DSparkProposer
++
++                self.drafter = DSparkProposer(self.vllm_config, self.device, self)
++                self.use_aux_hidden_state_outputs = True
+             elif self.speculative_config.use_dflash():
+                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                 self.use_aux_hidden_state_outputs = True
+@@ -1106,6 +1117,60 @@
+             buf.np[:num_reqs] = np.where(valid, ids, -1)
+         return buf.copy_to_gpu()
+ 
++    def _dsv41_engram_static_meta(self):
++        """Static (query_start_loc, slot_mapping, block_table) buffers of the Engram SWA
++        group so the model can hash n-grams inside PIECEWISE graph capture."""
++        prefix = self.__dict__.get("_dsv41_engram_prefix", "?")
++        if prefix == "?":
++            prefix = None
++            for m in getattr(self, "model", torch.nn.Module()).modules():
++                p = getattr(m, "engram_swa_prefix", None)
++                if p is not None:
++                    prefix = p
++                    break
++            self.__dict__["_dsv41_engram_prefix"] = prefix
++        cfg = getattr(self, "kv_cache_config", None)
++        if prefix is None or cfg is None:
++            return None
++        gid = self.__dict__.get("_dsv41_engram_gid")
++        if gid is None:
++            # index into input_batch.block_table, which skips encoder-only groups
++            bt_idx = 0
++            for g in cfg.kv_cache_groups:
++                if get_kv_cache_spec_kind(g.kv_cache_spec) == KVCacheSpecKind.ENCODER_ONLY_ATTENTION:
++                    continue
++                if prefix in g.layer_names:
++                    gid = bt_idx
++                    break
++                bt_idx += 1
++            if gid is None:
++                return None
++            self.__dict__["_dsv41_engram_gid"] = gid
++            _bt0 = self.input_batch.block_table[gid]
++            logger.info("DSV41 engram static meta: group %d (block_size %d, table %s) for %s",
++                        gid, _bt0.block_size, tuple(_bt0.block_table.gpu.shape), prefix)
++        bt = self.input_batch.block_table[gid]
++        return (self.query_start_loc.gpu, bt.slot_mapping.gpu, bt.block_table.gpu)
++
++    def _dsv41_pad_view(self, num_padded: int) -> torch.Tensor:
++        """Static bool buffer [max tokens]: True for CUDA-graph padding rows."""
++        buf = self.__dict__.get("_dsv41_pad_buf")
++        if buf is None or buf.numel() < num_padded:
++            n = max(int(num_padded), int(getattr(self, "max_num_tokens", num_padded)) * 2)
++            buf = torch.zeros(n, dtype=torch.bool, device=self.device)
++            self.__dict__["_dsv41_pad_buf"] = buf
++            self.__dict__["_dsv41_pad_cpu"] = torch.zeros(n, dtype=torch.bool, device="cpu", pin_memory=True)
++        return buf[:num_padded]
++
++    def _dsv41_pad_set(self, num_actual: int, num_padded: int) -> torch.Tensor:
++        view = self._dsv41_pad_view(num_padded)
++        cpu = self.__dict__["_dsv41_pad_cpu"]
++        cpu[:num_padded] = False
++        if num_padded > num_actual:
++            cpu[num_actual:num_padded] = True
++        view.copy_(cpu[:num_padded], non_blocking=True)
++        return view
++
+     def _init_model_kwargs(self, num_reqs: int | None = None):
+         model_kwargs = dict[str, Any]()
+ 
+@@ -1115,6 +1180,10 @@
+             model_kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
+                 num_reqs
+             )
++            # dsv41: engram static meta (see overlay/patch_engram_piecewise.py)
++            meta = self._dsv41_engram_static_meta()
++            if meta is not None:
++                model_kwargs["engram_static_meta"] = meta
+ 
+         if not self.is_pooling_model:
+             return model_kwargs
+@@ -1456,18 +1525,20 @@
+                     # sampled token ids back because there's no direct communication
+                     # between the first-stage worker and the last-stage worker.
+                     new_token_ids = req_data.new_token_ids[i]
+-                    # Add the sampled token(s) from the previous step (if any).
+-                    # This doesn't include "unverified" tokens like spec tokens.
+-                    num_new_tokens = (
+-                        num_computed_tokens + len(new_token_ids) - req_state.num_tokens
+-                    )
+-                    if num_new_tokens == 1:
+-                        # Avoid slicing list in most common case.
+-                        req_state.output_token_ids.append(new_token_ids[-1])
+-                    elif num_new_tokens > 0:
+-                        req_state.output_token_ids.extend(
+-                            new_token_ids[-num_new_tokens:]
+-                        )
++                    # dsv41: append exactly what the scheduler sent (it sends every
++                    # output token the worker has not seen, drafts accepted last
++                    # step included; see patch_pp_spec_tokens.py).
++                    if new_token_ids:
++                        # Re-sent tokens (re-prefill after preemption) are dropped:
++                        # the scheduler's slice ends at the current non-draft token.
++                        _end = num_computed_tokens + scheduler_output.num_scheduled_tokens[
++                            req_id
++                        ] - len(scheduled_spec_tokens.get(req_id, ()))
++                        _drop = max(0, req_state.num_tokens - (_end - len(new_token_ids)))
++                        if _drop:
++                            new_token_ids = new_token_ids[_drop:]
++                        if new_token_ids:
++                            req_state.output_token_ids.extend(new_token_ids)
+             elif num_output_tokens < len(req_state.output_token_ids):
+                 # Some output tokens were discarded due to a sync-KV-load
+                 # failure, or output_token_ids was inflated by the optimistic
+@@ -1523,18 +1594,21 @@
+                 # than num_tokens_no_spec.
+                 # Async scheduled PP: no new_token_ids, advance num_tokens_no_spec
+                 # according to num_computed_tokens.
+-                end_token_index = max(
+-                    start_token_index,
+-                    num_computed_tokens + len(new_token_ids),
+-                )
++                if new_token_ids:
++                    # dsv41: the received tokens are exactly the ones missing
++                    # from [start_token_index, ...).
++                    end_token_index = start_token_index + len(new_token_ids)
++                else:
++                    end_token_index = max(
++                        start_token_index,
++                        num_computed_tokens + len(new_token_ids),
++                    )
+                 if end_token_index > start_token_index:
+                     if new_token_ids:
+                         # Add new_token_ids to token_ids_cpu.
+-                        num_new_tokens = end_token_index - start_token_index
+-                        tokens_to_append = new_token_ids[-num_new_tokens:]
+                         self.input_batch.token_ids_cpu[
+                             req_index, start_token_index:end_token_index
+-                        ] = tokens_to_append
++                        ] = new_token_ids
+                     self.input_batch.is_token_ids[
+                         req_index, start_token_index:end_token_index
+                     ] = True
+@@ -4011,13 +4085,20 @@
+         Checks if it's a decode batch with same amount scheduled tokens
+         across all requests.
+         """
++        if force_uniform_decode is not None:
++            return force_uniform_decode
++        if (
++            (max_num_scheduled_tokens == uniform_decode_query_len)
++            and (num_tokens == max_num_scheduled_tokens * num_reqs)
++        ):
++            return True
++        # dsv41 qall: any uniform query length below K+1 (draft-less steps, partially kept
++        # drafts) dispatches to its own FULL family
+         return (
+-            (
+-                (max_num_scheduled_tokens == uniform_decode_query_len)
+-                and (num_tokens == max_num_scheduled_tokens * num_reqs)
+-            )
+-            if force_uniform_decode is None
+-            else force_uniform_decode
++            uniform_decode_query_len > 1
++            and 1 <= max_num_scheduled_tokens < uniform_decode_query_len
++            and num_tokens == max_num_scheduled_tokens * num_reqs
++            and os.environ.get("DSV41_FULL_Q1", "1") == "1"
+         )
+ 
+     def _allow_microbatching(
+@@ -4117,12 +4198,28 @@
+                 uniform_decode=uniform_decode,
+                 num_active_loras=num_active_loras,
+                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
++                uniform_query_len=max_num_scheduled_tokens if uniform_decode else None,
+                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+             )
+ 
+         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+             num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
+         )
++        # dsv41: prefill-shaped batches run eagerly instead of in piecewise graphs
++        if (
++            cudagraph_mode == CUDAGraphMode.PIECEWISE
++            and force_uniform_decode is None  # real steps only (capture/dummy runs force it)
++            and not force_eager
++            and os.environ.get("DSV41_PREFILL_EAGER", "1") == "1"
++            and max_num_scheduled_tokens > self.uniform_decode_query_len
++        ):
++            cudagraph_mode, batch_descriptor = dispatch_cudagraph(
++                num_tokens_padded, valid_modes={CUDAGraphMode.NONE}
++            )
++        if os.environ.get("DSV41_DEBUG_SPEC") == "1" and force_uniform_decode is None and num_tokens <= 8:
++            logger.info("DSV41 DISPATCH tokens=%d reqs=%d maxq=%d uniform=%s -> %s %s",
++                        num_tokens, num_reqs, max_num_scheduled_tokens, uniform_decode,
++                        cudagraph_mode, batch_descriptor)
+         num_tokens_padded = batch_descriptor.num_tokens
+         if self.compilation_config.pass_config.enable_sp:
+             assert (
+@@ -4568,6 +4665,7 @@
+                 ubatch_slices=ubatch_slices_padded,
+                 slot_mapping=slot_mappings,
+                 skip_compiled=has_encoder_input,
++                is_padding=self._dsv41_pad_set(num_tokens_unpadded, num_tokens_padded),
+             ),
+             record_function_or_nullcontext("gpu_model_runner: forward"),
+             self.maybe_get_kv_connector_output(
+@@ -5651,6 +5749,17 @@
+             if eagle_config and isinstance(eagle_config, dict):
+                 layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+ 
++        if not layer_ids:
++            # dsv41 dspark: v4.1 reads the attention *inputs* of its target layers and the
++            # model captures the entry stream of layer L when idx + 1 == L (ids as-is);
++            # v4 ids are capture-after and keep the +1 (mirrors V2 eagle3_utils).
++            dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
++            if dspark_layer_ids:
++                if getattr(hf_config, "model_type", None) == "deepseek_v41":
++                    layer_ids = list(dspark_layer_ids)
++                else:
++                    layer_ids = [i + 1 for i in dspark_layer_ids]
++
+         if layer_ids and isinstance(layer_ids, (list, tuple)):
+             return tuple(layer_ids)
+ 
+@@ -5968,6 +6077,7 @@
+         num_active_loras: int = 0,
+         profile_seq_lens: int | None = None,
+         randomize_inputs: bool = False,
++        uniform_query_len: int | None = None,  # dsv41 q1
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """
+         Run a dummy forward pass to warm up/profile run or capture the
+@@ -6020,7 +6130,11 @@
+         # When setting max_query_len = 1, we switch to and capture the optimized
+         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
+         # for GQA/MQA.
+-        max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
++        max_query_len = (
++            (uniform_query_len or self.uniform_decode_query_len)
++            if uniform_decode
++            else num_tokens
++        )
+ 
+         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
+         # for dummy run with LoRA so that the num_reqs collectively
+@@ -6277,6 +6391,7 @@
+                     batch_descriptor=batch_desc,
+                     ubatch_slices=ubatch_slices_padded,
+                     slot_mapping=slot_mappings,
++                    is_padding=self._dsv41_pad_view(num_tokens_padded),
+                 ),
+             ):
+                 outputs = self.model(
+@@ -6292,7 +6407,7 @@
+             else:
+                 hidden_states = outputs
+ 
+-            if self.speculative_config and (
++            if self.speculative_config and self.drafter is not None and (
+                 self.speculative_config.use_eagle()
+                 or self.speculative_config.uses_draft_model()
+                 or self.speculative_config.uses_extract_hidden_states()
+@@ -7063,6 +7178,11 @@
+                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                 force_attention=force_attention,
+                 uniform_decode=desc.uniform,
++                uniform_query_len=(
++                    desc.num_tokens // desc.num_reqs
++                    if (desc.uniform and desc.num_reqs)
++                    else None
++                ),
+                 allow_microbatching=allow_microbatching,
+                 skip_eplb=True,
+                 remove_lora=False,
+@@ -7083,6 +7203,11 @@
+                 desc.num_tokens,
+                 cudagraph_runtime_mode=cudagraph_runtime_mode,
+                 uniform_decode=desc.uniform,
++                uniform_query_len=(
++                    desc.num_tokens // desc.num_reqs
++                    if (desc.uniform and desc.num_reqs)
++                    else None
++                ),
+                 allow_microbatching=allow_microbatching,
+                 skip_eplb=True,
+                 remove_lora=False,
+@@ -7274,7 +7399,7 @@
+         self.calculate_reorder_batch_threshold()
+ 
+         # Initialize drafter attention backend
+-        if self.speculative_config and (
++        if self.speculative_config and self.drafter is not None and (
+             self.speculative_config.use_eagle()
+             or self.speculative_config.uses_draft_model()
+         ):
+@@ -7311,6 +7436,14 @@
+                 if cg_support.value < min_cg_support.value:
+                     min_cg_support = cg_support
+                     min_cg_attn_backend = attn_backend.__name__
++        if (
++            self.uniform_decode_query_len > 1
++            and os.environ.get("DSV41_FULL_Q1", "1") == "1"
++        ):
++            # dsv41 q1: keep capture sizes 1..K (the dispatcher filters the K+1 family)
++            self.compilation_config.adjust_cudagraph_sizes_for_spec_decode = (
++                lambda *a, **k: None
++            )
+         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
+             min_cg_support,
+             min_cg_attn_backend,
+@@ -7328,7 +7461,7 @@
+         )
+ 
+         # Initialize drafter's cudagraph dispatcher if using spec decode.
+-        if self.speculative_config and (
++        if self.speculative_config and self.drafter is not None and (
+             self.speculative_config.use_eagle()
+             or self.speculative_config.uses_draft_model()
+             or self.speculative_config.uses_extract_hidden_states()
+@@ -7388,7 +7521,17 @@
+                 continue
+             block_size = kv_cache_spec.block_size
+             block_sizes.append(block_size)
+-            if kv_cache_spec_kind == KVCacheSpecKind.MAMBA:
++            # dsv41: circular ring groups (V4.1 compressor) keep one block per
++            # request and compute their own ring slots; the generic kernel
++            # would read past the padded 16-column block-table row.
++            _dsv41_layer_spec = (
++                kv_cache_spec.first_spec
++                if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs)
++                else kv_cache_spec
++            )
++            if kv_cache_spec_kind == KVCacheSpecKind.MAMBA or isinstance(
++                _dsv41_layer_spec, CircularBufferSpec
++            ):
+                 slot_mapping_modes.append(SlotMappingMode.NONE)
+             else:
+                 slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/worker/gpu_worker.py vllm/v1/worker/gpu_worker.py
+--- image-official/v1/worker/gpu_worker.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/v1/worker/gpu_worker.py	2026-09-11 22:48:53.772949536 -0700
+@@ -99,6 +99,26 @@
+ 
+ logger = init_logger(__name__)
+ 
++if os.environ.get("DSV41_DEBUG_SYNC") == "1":
++    from vllm.v1.worker import block_table as _dsv41_bt_mod
++
++    def _dsv41_multi_compute_slot_mapping(self, num_reqs, query_start_loc, positions):
++        for _i, _bt in enumerate(self.block_tables):
++            try:
++                _bt.compute_slot_mapping(num_reqs, query_start_loc, positions)
++                torch.cuda.synchronize()
++            except Exception:
++                logger.error(
++                    "DSV41 slot mapping FAILED in group %d (block_size=%d kv_block=%d bpk=%d "
++                    "table=%s) num_reqs=%d qsl=%s pos[min,max]=%s",
++                    _i, _bt.block_size, _bt.kv_cache_block_size, _bt.blocks_per_kv_block,
++                    tuple(_bt.block_table.gpu.shape), num_reqs,
++                    query_start_loc.cpu().tolist()[:8] if False else "n/a", "n/a",
++                )
++                raise
++
++    _dsv41_bt_mod.MultiGroupBlockTable.compute_slot_mapping = _dsv41_multi_compute_slot_mapping
++
+ 
+ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
+     spec_config = vllm_config.speculative_config
+@@ -1126,6 +1146,10 @@
+         intermediate_tensors = None
+         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
++        _dsv41_trace = os.environ.get("DSV41_DEBUG_TRACE") == "1" and forward_pass
++        if _dsv41_trace:
++            self._dsv41_tr_step = getattr(self, "_dsv41_tr_step", 0) + 1
++            _dsv41_tr = {"in": time.perf_counter()}
+         all_gather_tensors = {}
+         compilation_config = self.vllm_config.compilation_config
+         parallel_config = self.vllm_config.parallel_config
+@@ -1159,6 +1183,27 @@
+                 )
+             }
+ 
++        _dsv41_sync = os.environ.get("DSV41_DEBUG_SYNC") == "1"
++        if _dsv41_sync and not getattr(self, "_dsv41_bt_logged", False):
++            self._dsv41_bt_logged = True
++            try:
++                for _i, _bt in enumerate(self.model_runner.input_batch.block_table.block_tables):
++                    logger.info(
++                        "DSV41 block table group %d: block_size=%d kv_cache_block_size=%d "
++                        "blocks_per_kv_block=%d max_blocks_per_req=%d table=%s stride0=%d mode=%s",
++                        _i, _bt.block_size, _bt.kv_cache_block_size, _bt.blocks_per_kv_block,
++                        _bt.max_num_blocks_per_req, tuple(_bt.block_table.gpu.shape),
++                        _bt.block_table.gpu.stride(0), str(_bt.slot_mapping_mode),
++                    )
++            except Exception as _e:  # pragma: no cover
++                logger.warning("DSV41 block table log failed: %s", _e)
++        if _dsv41_sync:
++            try:
++                torch.cuda.synchronize()
++            except Exception:
++                logger.error("DSV41 SYNC-BEFORE-IRECV failed (sticky error from the previous step)")
++                raise
++            _dsv41_t0 = time.perf_counter()
+         if forward_pass and not get_pp_group().is_first_rank:
+             tensor_dict, comm_handles, comm_postprocess = (
+                 get_pp_group().irecv_tensor_dict(
+@@ -1172,21 +1217,93 @@
+                 comm_handles=comm_handles,
+                 comm_postprocess=comm_postprocess,
+             )
++        if _dsv41_trace:
++            _dsv41_tr["recv_posted"] = time.perf_counter()
+ 
++        if _dsv41_sync:
++            try:
++                torch.cuda.synchronize()
++            except Exception:
++                logger.error("DSV41 SYNC-AFTER-IRECV failed (PP recv kernels faulted)")
++                raise
++            _dsv41_t1 = time.perf_counter()
++        _dsv41_prof = None
++        if os.environ.get("DSV41_DEBUG_PROFILE") == "1" and scheduler_output.total_num_scheduled_tokens == 1:
++            self._dsv41_pcount = getattr(self, "_dsv41_pcount", 0) + 1
++            if self._dsv41_pcount in (40, 41):
++                from torch.profiler import ProfilerActivity, profile as _tprofile
++                _dsv41_prof = _tprofile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
++                _dsv41_prof.__enter__()
+         with self.annotate_profile(scheduler_output):
+             output = self.model_runner.execute_model(
+                 scheduler_output, intermediate_tensors
+             )
+-            if (
+-                self.use_v2_model_runner
+-                and self.model_runner.is_pooling_model
+-                and output is None
+-            ):
+-                output = self.model_runner.pool()  # type: ignore
+-            if isinstance(
+-                output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
+-            ):
+-                return output
++        if _dsv41_trace:
++            _dsv41_tr["launched"] = time.perf_counter()
++            _dsv41_ev = torch.cuda.Event()
++            _dsv41_ev.record()
++            _dsv41_step = self._dsv41_tr_step
++            _dsv41_rank = get_pp_group().rank_in_group
++
++            def _dsv41_tr_emit(tr=_dsv41_tr, ev=_dsv41_ev, step=_dsv41_step, rank=_dsv41_rank,
++                               T=num_scheduled_tokens):
++                if not (
++                    40 <= step <= 44
++                    or (T > 1 and step <= 60 and os.environ.get("DSV41_DEBUG_TRACE_PREFILL") == "1")
++                ):
++                    return
++                import threading
++
++                def _w():
++                    ev.synchronize()
++                    tr["gpu_done"] = time.perf_counter()
++                    logger.info("DSV41 TRACE rank %d step %d T=%d %s", rank, step, T,
++                                " ".join(f"{k}={v:.4f}" for k, v in tr.items()))
++                threading.Thread(target=_w, daemon=True).start()
++        if _dsv41_prof is not None:
++            torch.cuda.synchronize()
++            _dsv41_prof.__exit__(None, None, None)
++            if self._dsv41_pcount == 41:
++                ka = _dsv41_prof.key_averages()
++                rows = sorted(ka, key=lambda e: -getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0)))
++                tot = sum(getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0)) for e in ka
++                          if not getattr(e, "is_async", False))
++                lines = [f"DSV41 PROFILE rank {get_pp_group().rank_in_group} T=1 step: kernels by device time (us); "
++                         f"self-cpu total {sum(e.self_cpu_time_total for e in ka):.0f} us; device total {tot:.0f} us"]
++                for e in rows[:40]:
++                    dt = getattr(e, "device_time_total", getattr(e, "cuda_time_total", 0))
++                    if dt <= 0:
++                        continue
++                    lines.append(f"  {dt:9.0f} us  n={e.count:4d}  {e.key[:110]}")
++                lines.append("  -- by self CPU time (us) --")
++                for e in sorted(ka, key=lambda e: -e.self_cpu_time_total)[:30]:
++                    lines.append(f"  {e.self_cpu_time_total:9.0f} us  n={e.count:4d}  {e.key[:110]}")
++                logger.info("\n".join(lines))
++        if _dsv41_sync:
++            torch.cuda.synchronize()
++            _dsv41_t2 = time.perf_counter()
++            _T = scheduler_output.total_num_scheduled_tokens
++            if _T == 0:
++                self._dsv41_empty = getattr(self, "_dsv41_empty", 0) + 1
++            elif _T == 1:
++                self._dsv41_steps = getattr(self, "_dsv41_steps", 0) + 1
++                if self._dsv41_steps % 16 == 0:
++                    logger.info("DSV41 STEP T=1 recv-wait %.2f ms forward %.2f ms (empty calls so far %d, T=1 steps %d)",
++                                (_dsv41_t1 - _dsv41_t0) * 1e3, (_dsv41_t2 - _dsv41_t1) * 1e3,
++                                getattr(self, "_dsv41_empty", 0), self._dsv41_steps)
++        if (
++            self.use_v2_model_runner
++            and self.model_runner.is_pooling_model
++            and output is None
++        ):
++            output = self.model_runner.pool()  # type: ignore
++        if isinstance(
++            output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
++        ):
++            if _dsv41_trace:
++                _dsv41_tr["out"] = time.perf_counter()
++                _dsv41_tr_emit()
++            return output
+ 
+         assert isinstance(output, IntermediateTensors)
+         parallel_config = self.vllm_config.parallel_config
+@@ -1204,6 +1321,9 @@
+             all_gather_tensors=all_gather_tensors,
+         )
+         self._pp_send_work = handles[1:]
++        if _dsv41_trace:
++            _dsv41_tr["sent"] = time.perf_counter()
++            _dsv41_tr_emit()
+ 
+         return None
+ 
+diff -ruN '--exclude=_version.py' '--exclude=__pycache__' image-official/v1/worker/utils.py vllm/v1/worker/utils.py
+--- image-official/v1/worker/utils.py	2026-09-09 23:38:04.000000000 -0700
++++ vllm/v1/worker/utils.py	2026-09-10 20:30:12.986768265 -0700
+@@ -431,11 +431,18 @@
+     kv_caches: dict[str, torch.Tensor] = {}
+     for tensor in kv_cache_config.kv_cache_tensors:
+         layer_name = tensor.layers[0]
+-        group_id, group = next(
+-            (group_id, group)
+-            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+-            if layer_name in group.layer_names
+-        )
++        try:
++            group_id, group = next(
++                (group_id, group)
++                for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
++                if layer_name in group.layer_names
++            )
++        except StopIteration:
++            raise RuntimeError(
++                f"KV tensor layer {layer_name!r} (tensor layers {tensor.layers}) is in no "
++                "KV cache group on this worker; groups: "
++                + str([g.layer_names for g in kv_cache_config.kv_cache_groups])
++            ) from None
+         spec = group.kv_cache_spec
+         if isinstance(spec, UniformTypeKVCacheSpecs):
+             spec = spec.kv_cache_specs[layer_name]
