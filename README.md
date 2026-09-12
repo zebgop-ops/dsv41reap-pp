@@ -35,6 +35,20 @@ greedy code edit is byte-identical to the unpruned model's output. The port itse
 `ktests/test_reap_router.py`, which matches the checkpoint's reference gate at 272 experts.
 So: near-free for coding, a real knowledge hit for everything else.
 
+## How it compares to the other models on this box
+
+Same harness, same 1000 MMLU questions, each model on its own stack ([CROSS-MODEL.md](CROSS-MODEL.md)):
+
+| model | wikitext bits/byte | code bits/byte | MMLU | decode |
+|---|---|---|---|---|
+| Qwen3.8-Flash-Next | 0.4394 | 0.0805 | 89.0% | 74 tok/s |
+| GLM-5.3-Flash W4A16 | 0.3884 | 0.1428 | 85.6% | 66-70 tok/s |
+| DeepSeek-V4.1-Flash unpruned | 0.3275 | 0.1044 | 84.4% | 14-22 tok/s |
+| this checkpoint (REAP-272E) | 0.4091 | 0.1046 | 76.7% | ~30 tok/s |
+
+Qwen3.8 is both faster and more accurate than everything else here, so reach for this checkpoint
+when you specifically want DeepSeek-family behaviour with a 512k context on code-shaped work.
+
 ## Quickstart
 
 ```bash

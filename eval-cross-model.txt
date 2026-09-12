@@ -1,0 +1,24 @@
+model                   wikitext2 bpb       stdlib bpb    MMLU  margin
+DSv41 unpruned                 0.3275          0.1044   84.4%    3.40
+DSv41R REAP-272E               0.4091          0.1046   76.7%    2.14
+Qwen3.8-Flash-Next             0.4394          0.0805   89.0%    3.91
+GLM-5.3-Flash W4A16            0.3884          0.1428   85.6%    3.94
+
+per-token perplexity (only comparable within a tokenizer family):
+  DSv41 unpruned       wikitext2:  2.7147 over  67131 tokens  stdlib:  1.3633 over  30589 tokens
+  DSv41R REAP-272E     wikitext2:  3.4821 over  67131 tokens  stdlib:  1.3642 over  30589 tokens
+  Qwen3.8-Flash-Next   wikitext2:  3.6428 over  69588 tokens  stdlib:  1.2683 over  30762 tokens
+  GLM-5.3-Flash W4A16  wikitext2:  3.2366 over  67705 tokens  stdlib:  1.5727 over  28645 tokens
+
+paired MMLU over the same questions (row beats column, by points):
+                      DSv41 unpru  DSv41R REAP  Qwen3.8-Fla  GLM-5.3-Fla
+DSv41 unpruned                  -    +7.7*       -4.6*       -1.2    
+DSv41R REAP-272E         -7.7*              -   -12.3*       -8.9*   
+Qwen3.8-Flash-Next       +4.6*      +12.3*              -    +3.4*   
+GLM-5.3-Flash W4A16      +1.2        +8.9*       -3.4*              -
+  (* significant at p<0.05, McNemar exact on the discordant pairs)
+
+agreement with DSv41 unpruned (same predicted letter):
+  DSv41R REAP-272E     0.817
+  Qwen3.8-Flash-Next   0.856
+  GLM-5.3-Flash W4A16  0.848
