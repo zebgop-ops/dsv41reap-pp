@@ -30,6 +30,8 @@ loss is far larger, and it is concentrated in knowledge-heavy prose rather than 
 | stdlib code bits per byte | 0.1044 | 0.1046 | +0.2% |
 | — paired per-window NLL | | | +0.0004 nats ±0.0092 (not distinguishable from zero) |
 | MMLU, 1000 questions, same questions both models | 84.4% | 76.7% | **−7.7 points** |
+| HumanEval+ pass@1 (executed, same 164 tasks) | 93.9% (154) | 93.9% (154) | **0.0** |
+| MBPP+ pass@1 (executed, same 378 tasks) | 84.9% (321) | 83.3% (315) | −1.6 (not significant) |
 | — correct vs best distractor, mean margin | 3.40 nats | 2.14 nats | −1.26 nats |
 
 Paired MMLU: 730 both correct, 114 the unpruned model alone, 37 REAP alone, 119 both wrong; the two
@@ -46,7 +48,8 @@ selection identical, weights within 1e-5, 16/16 pass. Independently, code perple
 and a 400-token greedy code edit is byte-identical to the unpruned model's output — a mis-routing
 bug could not leave those intact while costing 8 points of MMLU.
 
-**Reading it.** Code and code-shaped work look untouched; factual and reasoning-heavy prose loses
+**Reading it.** Code is untouched, and that now rests on executed tests rather than perplexity
+alone: HumanEval+ ties exactly and MBPP+ is within noise. Factual and reasoning-heavy prose loses
 real ground. If you serve this checkpoint for coding, the 2-3x speedup is close to free. If you
 serve it for knowledge questions, budget for roughly the accuracy of a substantially smaller model.
 
